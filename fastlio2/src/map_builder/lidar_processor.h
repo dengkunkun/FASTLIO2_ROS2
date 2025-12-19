@@ -45,4 +45,5 @@ private:
     CloudType::Ptr m_effect_norm_vec;
     std::vector<PointVec> m_nearest_points;
     pcl::VoxelGrid<PointType> m_scan_filter;
+    size_t m_buffer_size = 0;  // Dynamic buffer size for point cloud processing
 };

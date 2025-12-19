@@ -8,6 +8,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions" )
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fexceptions")
 
+# ASAN support for debugging - uncomment to enable AddressSanitizer
+option(ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
+if(ENABLE_ASAN)
+  message(STATUS "AddressSanitizer enabled for localizer")
+  set(CMAKE_BUILD_TYPE "RelWithDebInfo")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
+endif()
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-O3)
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -15,6 +26,8 @@ endif()
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -39,12 +52,33 @@ include_directories(
 set(SRC_LIST src/localizers/commons.cpp
              src/localizers/icp_localizer.cpp)
 
-add_executable(localizer_node src/localizer_node.cpp ${SRC_LIST})
-ament_target_dependencies(localizer_node rclcpp std_msgs sensor_msgs nav_msgs message_filters pcl_conversions tf2_ros geometry_msgs interface)
-target_link_libraries(localizer_node ${PCL_LIBRARIES}  yaml-cpp) 
+# Create shared library for composed node
+add_library(localizer_component SHARED src/localizer_node.cpp ${SRC_LIST})
+ament_target_dependencies(localizer_component 
+  rclcpp 
+  rclcpp_components
+  std_msgs 
+  sensor_msgs 
+  nav_msgs 
+  message_filters 
+  pcl_conversions 
+  tf2_ros 
+  geometry_msgs 
+  interface
+)
+target_link_libraries(localizer_component ${PCL_LIBRARIES} yaml-cpp)
 
+# Register as composed node component
+rclcpp_components_register_node(localizer_component
+  PLUGIN "LocalizerNode"
+  EXECUTABLE localizer_node
+)
 
-install(TARGETS localizer_node DESTINATION lib/${PROJECT_NAME})
+install(TARGETS localizer_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})

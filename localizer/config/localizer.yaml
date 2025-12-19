@@ -1,15 +1,75 @@
-cloud_topic: /fastlio2/body_cloud
-odom_topic: /fastlio2/lio_odom
-map_frame: map
-local_frame: lidar
-update_hz: 1.0
+# =============================================================================
+# Localizer Node 配置文件
+# =============================================================================
+# 功能：基于两阶段ICP的重定位节点，将FAST-LIO2的局部里程计对齐到全局地图
+# 输入：
+#   - body_cloud: 来自lio_node的body坐标系点云
+#   - lio_odom: 来自lio_node的里程计
+# 输出：
+#   - TF: map_frame → local_frame (地图到局部坐标系的变换)
+#   - Service: /localizer/relocalize (重定位服务)
+#   - Service: /localizer/relocalize_check (检查重定位状态)
+# =============================================================================
 
-rough_scan_resolution: 0.25
-rough_map_resolution: 0.25
-rough_max_iteration: 5
-rough_score_thresh: 0.2
+# -----------------------------------------------------------------------------
+# 话题配置 (Topic Configuration)
+# -----------------------------------------------------------------------------
+cloud_topic: /fastlio2/body_cloud  # 输入点云话题，来自lio_node的body坐标系点云
+odom_topic: /fastlio2/lio_odom     # 输入里程计话题，来自lio_node
 
-refine_scan_resolution: 0.1
-refine_map_resolution: 0.1
-refine_max_iteration: 10
-refine_score_thresh: 0.1
+# -----------------------------------------------------------------------------
+# 坐标系配置 (Frame Configuration)
+# -----------------------------------------------------------------------------
+# 重要说明：relocalize服务中的(x,y,z,yaw,pitch,roll)表示
+# body_frame在map_frame中的位姿，即机器人在全局地图中的位置
+# 注意：yaw/pitch/roll 单位为弧度（rad）
+map_frame: map_camera_init         # 全局地图坐标系名称
+local_frame: camera_init           # 局部坐标系名称（FAST-LIO2的world_frame）
+                                   # localizer发布 map_frame → local_frame 的TF
+
+# -----------------------------------------------------------------------------
+# 更新频率配置 (Update Rate)
+# -----------------------------------------------------------------------------
+update_hz: 1.0                     # ICP定位更新频率(Hz)
+                                   # 值越高响应越快但CPU占用越高
+                                   # 对于室内环境变化场景，建议0.5-2Hz
+
+# -----------------------------------------------------------------------------
+# 粗匹配ICP配置 (Rough ICP Configuration) - 第一阶段
+# -----------------------------------------------------------------------------
+# 粗匹配使用较大的体素分辨率，快速收敛到大致位置
+rough_scan_resolution: 0.25        # 输入扫描的体素滤波分辨率(m)
+rough_map_resolution: 0.25         # 地图的体素滤波分辨率(m)
+rough_max_iteration: 5             # 粗匹配最大迭代次数
+                                   # 增大可提高收敛成功率但耗时增加
+rough_score_thresh: 0.2            # 粗匹配fitness score阈值
+                                   # 值越大越宽松，建议0.2-0.4
+                                   # 如果环境有变化（如家具移动），建议增大到0.3-0.4
+
+# -----------------------------------------------------------------------------
+# 精匹配ICP配置 (Refine ICP Configuration) - 第二阶段
+# -----------------------------------------------------------------------------
+# 精匹配使用较小的体素分辨率，精确优化位姿
+refine_scan_resolution: 0.1        # 输入扫描的体素滤波分辨率(m)
+refine_map_resolution: 0.1         # 地图的体素滤波分辨率(m)
+refine_max_iteration: 10           # 精匹配最大迭代次数
+refine_score_thresh: 0.1           # 精匹配fitness score阈值
+                                   # 值越大越宽松，建议0.1-0.2
+
+# =============================================================================
+# 调参建议
+# =============================================================================
+# 1. 如果ICP经常失败（fitness score略高于阈值）:
+#    - 增大rough_score_thresh到0.3-0.4
+#    - 增大rough_max_iteration到10
+#    - 确保初始位姿估计在±1m和±30°以内
+#
+# 2. 室内环境有变化（家具移动等）:
+#    - 增大rough_score_thresh到0.35
+#    - 增大refine_score_thresh到0.15
+#    - 降低update_hz到0.5以减少错误校正
+#
+# 3. 如果定位精度不够:
+#    - 减小refine_scan_resolution到0.05
+#    - 增大refine_max_iteration到15
+# =============================================================================

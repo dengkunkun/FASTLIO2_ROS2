@@ -12,12 +12,18 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <queue>
 #include <filesystem>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 #include "pgos/commons.h"
 #include "pgos/simple_pgo.h"
 #include "interface/srv/save_maps.hpp"
 #include <pcl/io/io.h>
 #include <fstream>
 #include <yaml-cpp/yaml.h>
+
+// For component registration
+#include <rclcpp_components/register_node_macro.hpp>
 
 using namespace std::chrono_literals;
 
@@ -34,14 +40,17 @@ struct NodeState
     std::mutex message_mutex;
     std::queue<CloudWithPose> cloud_buffer;
     double last_message_time;
+    bool new_data_available = false;
 };
 
 class PGONode : public rclcpp::Node
 {
 public:
-    PGONode() : Node("pgo_node")
+    explicit PGONode(const rclcpp::NodeOptions & options)
+    : Node("pgo_node", rclcpp::NodeOptions(options).enable_logger_service(true))
+    , m_running(true)
     {
-        RCLCPP_INFO(this->get_logger(), "PGO node started");
+        RCLCPP_INFO(this->get_logger(), "PGO node started (Composed)");
         loadParameters();
         m_pgo = std::make_shared<SimplePGO>(m_pgo_config);
         rclcpp::QoS qos = rclcpp::QoS(10);
@@ -52,8 +61,24 @@ public:
         m_sync = std::make_shared<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>>(message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>(10), m_cloud_sub, m_odom_sub);
         m_sync->setAgePenalty(0.1);
         m_sync->registerCallback(std::bind(&PGONode::syncCB, this, std::placeholders::_1, std::placeholders::_2));
-        m_timer = this->create_wall_timer(50ms, std::bind(&PGONode::timerCB, this));
+        
+        // Timer for lightweight TF broadcasting
+        m_tf_timer = this->create_wall_timer(20ms, std::bind(&PGONode::tfTimerCB, this));
+        
         m_save_map_srv = this->create_service<interface::srv::SaveMaps>("/pgo/save_maps", std::bind(&PGONode::saveMapsCB, this, std::placeholders::_1, std::placeholders::_2));
+        
+        // Start PGO processing thread (heavy computation)
+        m_process_thread = std::thread(&PGONode::pgoProcessLoop, this);
+    }
+    
+    ~PGONode()
+    {
+        m_running = false;
+        m_cv.notify_all();
+        if (m_process_thread.joinable()) {
+            m_process_thread.join();
+        }
+        RCLCPP_INFO(this->get_logger(), "PGO Node Shutdown");
     }
 
     void loadParameters()
@@ -104,6 +129,71 @@ public:
         cp.cloud = CloudType::Ptr(new CloudType);
         pcl::fromROSMsg(*cloud_msg, *cp.cloud);
         m_state.cloud_buffer.push(cp);
+        m_state.new_data_available = true;
+        
+        // Notify processing thread
+        m_cv.notify_one();
+    }
+
+    // Lightweight TF timer - just broadcasts cached TF
+    void tfTimerCB()
+    {
+        if (m_pgo->keyPoses().empty()) return;
+        
+        builtin_interfaces::msg::Time cur_time = this->get_clock()->now();
+        sendBroadCastTF(cur_time);
+    }
+    
+    // PGO processing loop runs in separate thread
+    void pgoProcessLoop()
+    {
+        while (m_running) {
+            // Wait for new data or timeout
+            {
+                std::unique_lock<std::mutex> lock(m_cv_mutex);
+                m_cv.wait_for(lock, 50ms, [this]() {
+                    return !m_running || m_state.new_data_available;
+                });
+            }
+            
+            if (!m_running) break;
+            
+            processPGO();
+        }
+    }
+    
+    void processPGO()
+    {
+        if (m_state.cloud_buffer.empty())
+            return;
+            
+        CloudWithPose cp;
+        {
+            std::lock_guard<std::mutex> lock(m_state.message_mutex);
+            if (m_state.cloud_buffer.empty()) return;
+            cp = m_state.cloud_buffer.front();
+            // Clear queue
+            while (!m_state.cloud_buffer.empty())
+            {
+                m_state.cloud_buffer.pop();
+            }
+            m_state.new_data_available = false;
+        }
+        
+        builtin_interfaces::msg::Time cur_time;
+        cur_time.sec = cp.pose.sec;
+        cur_time.nanosec = cp.pose.nsec;
+        
+        if (!m_pgo->addKeyPose(cp))
+        {
+            return;
+        }
+
+        // Heavy computation - loop detection and optimization
+        m_pgo->searchForLoopPairs();
+        m_pgo->smoothAndUpdate();
+
+        publishLoopMarkers(cur_time);
     }
 
     void sendBroadCastTF(builtin_interfaces::msg::Time &time)
@@ -188,38 +278,6 @@ public:
         m_loop_marker_pub->publish(marker_array);
     }
 
-    void timerCB()
-    {
-        if (m_state.cloud_buffer.size() == 0)
-            return;
-        CloudWithPose cp = m_state.cloud_buffer.front();
-        // 清理队列
-        {
-            std::lock_guard<std::mutex>(m_state.message_mutex);
-            while (!m_state.cloud_buffer.empty())
-            {
-                m_state.cloud_buffer.pop();
-            }
-        }
-        builtin_interfaces::msg::Time cur_time;
-        cur_time.sec = cp.pose.sec;
-        cur_time.nanosec = cp.pose.nsec;
-        if (!m_pgo->addKeyPose(cp))
-        {
-
-            sendBroadCastTF(cur_time);
-            return;
-        }
-
-        m_pgo->searchForLoopPairs();
-
-        m_pgo->smoothAndUpdate();
-
-        sendBroadCastTF(cur_time);
-
-        publishLoopMarkers(cur_time);
-    }
-
     void saveMapsCB(const std::shared_ptr<interface::srv::SaveMaps::Request> request, std::shared_ptr<interface::srv::SaveMaps::Response> response)
     {
         if (!std::filesystem::exists(request->file_path))
@@ -289,19 +347,20 @@ private:
     Config m_pgo_config;
     NodeState m_state;
     std::shared_ptr<SimplePGO> m_pgo;
-    rclcpp::TimerBase::SharedPtr m_timer;
+    rclcpp::TimerBase::SharedPtr m_tf_timer;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr m_loop_marker_pub;
     rclcpp::Service<interface::srv::SaveMaps>::SharedPtr m_save_map_srv;
     message_filters::Subscriber<sensor_msgs::msg::PointCloud2> m_cloud_sub;
     message_filters::Subscriber<nav_msgs::msg::Odometry> m_odom_sub;
     std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
     std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>> m_sync;
+    
+    // Thread management for async PGO processing
+    std::thread m_process_thread;
+    std::atomic<bool> m_running;
+    std::mutex m_cv_mutex;
+    std::condition_variable m_cv;
 };
 
-int main(int argc, char **argv)
-{
-    rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PGONode>());
-    rclcpp::shutdown();
-    return 0;
-}
+// Register as composed node
+RCLCPP_COMPONENTS_REGISTER_NODE(PGONode)

@@ -5,12 +5,18 @@ LidarProcessor::LidarProcessor(Config &config, std::shared_ptr<IESKF> kf) : m_co
     m_ikdtree = std::make_shared<KD_TREE<PointType>>();
     m_ikdtree->set_downsample_param(m_config.map_resolution);
     m_cloud_down_lidar.reset(new CloudType);
-    m_cloud_down_world.reset(new CloudType(10000, 1));
-    m_norm_vec.reset(new CloudType(10000, 1));
-    m_effect_cloud_lidar.reset(new CloudType(10000, 1));
-    m_effect_norm_vec.reset(new CloudType(10000, 1));
-    m_nearest_points.resize(10000);
-    m_point_selected_flag.resize(10000, false);
+    m_cloud_down_world.reset(new CloudType);
+    m_norm_vec.reset(new CloudType);
+    m_effect_cloud_lidar.reset(new CloudType);
+    m_effect_norm_vec.reset(new CloudType);
+    // Initial allocation - will be resized dynamically in process() if needed
+    m_buffer_size = 10000;
+    m_cloud_down_world->resize(m_buffer_size);
+    m_norm_vec->resize(m_buffer_size);
+    m_effect_cloud_lidar->resize(m_buffer_size);
+    m_effect_norm_vec->resize(m_buffer_size);
+    m_nearest_points.resize(m_buffer_size);
+    m_point_selected_flag.resize(m_buffer_size, false);
 
     if (m_config.scan_resolution > 0.0)
     {
@@ -167,6 +173,21 @@ void LidarProcessor::process(SyncPackage &package)
     {
         pcl::copyPointCloud(*package.cloud, *m_cloud_down_lidar);
     }
+    
+    // Dynamically resize buffers if cloud size exceeds current buffer size
+    size_t cloud_size = m_cloud_down_lidar->size();
+    if (cloud_size > m_buffer_size)
+    {
+        m_buffer_size = cloud_size + 1000; // Add some margin to avoid frequent resizing
+        m_cloud_down_world->resize(m_buffer_size);
+        m_norm_vec->resize(m_buffer_size);
+        m_effect_cloud_lidar->resize(m_buffer_size);
+        m_effect_norm_vec->resize(m_buffer_size);
+        m_nearest_points.resize(m_buffer_size);
+        m_point_selected_flag.resize(m_buffer_size, false);
+        std::cout << "[LidarProcessor] Resized buffers to " << m_buffer_size << std::endl;
+    }
+    
     trimCloudMap();
     m_kf->update();
     incrCloudMap();

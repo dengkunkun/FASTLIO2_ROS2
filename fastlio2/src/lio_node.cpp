@@ -4,6 +4,9 @@
 #include <memory>
 #include <iostream>
 #include <chrono>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 // #include <filesystem>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -20,6 +23,9 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <yaml-cpp/yaml.h>
+
+// For component registration
+#include <rclcpp_components/register_node_macro.hpp>
 
 using namespace std::chrono_literals;
 struct NodeConfig
@@ -45,9 +51,11 @@ struct StateData
 class LIONode : public rclcpp::Node
 {
 public:
-    LIONode() : Node("lio_node")
+    explicit LIONode(const rclcpp::NodeOptions & options)
+    : Node("lio_node", rclcpp::NodeOptions(options).enable_logger_service(true))
+    , m_running(true)
     {
-        RCLCPP_INFO(this->get_logger(), "LIO Node Started");
+        RCLCPP_INFO(this->get_logger(), "LIO Node Started (Composed)");
         loadParameters();
 
         m_imu_sub = this->create_subscription<sensor_msgs::msg::Imu>(m_node_config.imu_topic, 10, std::bind(&LIONode::imuCB, this, std::placeholders::_1));
@@ -64,7 +72,19 @@ public:
 
         m_kf = std::make_shared<IESKF>();
         m_builder = std::make_shared<MapBuilder>(m_builder_config, m_kf);
-        m_timer = this->create_wall_timer(20ms, std::bind(&LIONode::timerCB, this));
+        
+        // Start processing thread for heavy computation (avoiding callback blocking)
+        m_process_thread = std::thread(&LIONode::processLoop, this);
+    }
+    
+    ~LIONode()
+    {
+        m_running = false;
+        m_cv.notify_all();
+        if (m_process_thread.joinable()) {
+            m_process_thread.join();
+        }
+        RCLCPP_INFO(this->get_logger(), "LIO Node Shutdown");
     }
 
     void loadParameters()
@@ -139,6 +159,9 @@ public:
         }
         m_state_data.lidar_buffer.emplace_back(timestamp, cloud);
         m_state_data.last_lidar_time = timestamp;
+        
+        // Notify processing thread that new data is available
+        m_cv.notify_one();
     }
 
     bool syncPackage()
@@ -240,7 +263,26 @@ public:
         broad_caster->sendTransform(transformStamped);
     }
 
-    void timerCB()
+    // Processing loop runs in separate thread to avoid blocking ROS callbacks
+    void processLoop()
+    {
+        while (m_running) {
+            // Wait for new data or shutdown signal
+            {
+                std::unique_lock<std::mutex> lock(m_cv_mutex);
+                m_cv.wait_for(lock, 20ms, [this]() {
+                    return !m_running || !m_state_data.lidar_buffer.empty();
+                });
+            }
+            
+            if (!m_running) break;
+            
+            // Process available data
+            processOnce();
+        }
+    }
+
+    void processOnce()
     {
         if (!syncPackage())
             return;
@@ -272,6 +314,12 @@ public:
         publishPath(m_path_pub, m_node_config.world_frame, m_package.cloud_end_time);
     }
 
+    // Keep timerCB for backward compatibility (not used with thread model)
+    void timerCB()
+    {
+        processOnce();
+    }
+
 private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr m_lidar_sub;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr m_imu_sub;
@@ -289,12 +337,13 @@ private:
     std::shared_ptr<IESKF> m_kf;
     std::shared_ptr<MapBuilder> m_builder;
     std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
+    
+    // Thread management for async processing
+    std::thread m_process_thread;
+    std::atomic<bool> m_running;
+    std::mutex m_cv_mutex;
+    std::condition_variable m_cv;
 };
 
-int main(int argc, char **argv)
-{
-    rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<LIONode>());
-    rclcpp::shutdown();
-    return 0;
-}
+// Register as composed node
+RCLCPP_COMPONENTS_REGISTER_NODE(LIONode)

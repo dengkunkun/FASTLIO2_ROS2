@@ -1,6 +1,9 @@
 #include <queue>
 #include <mutex>
 #include <filesystem>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -17,6 +20,9 @@
 #include "interface/srv/relocalize.hpp"
 #include "interface/srv/is_valid.hpp"
 #include <yaml-cpp/yaml.h>
+
+// For component registration
+#include <rclcpp_components/register_node_macro.hpp>
 
 using namespace std::chrono_literals;
 
@@ -45,14 +51,19 @@ struct NodeState
     M3D last_offset_r = M3D::Identity(); // map_localmap_r
     V3D last_offset_t = V3D::Zero();     // map_localmap_t
     M4F initial_guess = M4F::Identity();
+    
+    // For async processing
+    bool new_data_available = false;
 };
 
 class LocalizerNode : public rclcpp::Node
 {
 public:
-    LocalizerNode() : Node("localizer_node")
+    explicit LocalizerNode(const rclcpp::NodeOptions & options)
+    : Node("localizer_node", rclcpp::NodeOptions(options).enable_logger_service(true))
+    , m_running(true)
     {
-        RCLCPP_INFO(this->get_logger(), "Localizer Node Started");
+        RCLCPP_INFO(this->get_logger(), "Localizer Node Started (Composed)");
         loadParameters();
         rclcpp::QoS qos = rclcpp::QoS(10);
         m_cloud_sub.subscribe(this, m_config.cloud_topic, qos.get_rmw_qos_profile());
@@ -63,7 +74,7 @@ public:
         m_sync = std::make_shared<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>>(message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>(10), m_cloud_sub, m_odom_sub);
         m_sync->setAgePenalty(0.1);
         m_sync->registerCallback(std::bind(&LocalizerNode::syncCB, this, std::placeholders::_1, std::placeholders::_2));
-        m_localizer = std::make_shared<ICPLocalizer>(m_localizer_config);
+        m_localizer = std::make_shared<ICPLocalizer>(m_localizer_config, this->get_logger());
 
         m_reloc_srv = this->create_service<interface::srv::Relocalize>("relocalize", std::bind(&LocalizerNode::relocCB, this, std::placeholders::_1, std::placeholders::_2));
 
@@ -71,7 +82,21 @@ public:
 
         m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", 10);
 
-        m_timer = this->create_wall_timer(10ms, std::bind(&LocalizerNode::timerCB, this));
+        // Timer for TF broadcasting (lightweight, stays in callback thread)
+        m_tf_timer = this->create_wall_timer(10ms, std::bind(&LocalizerNode::tfTimerCB, this));
+        
+        // Start ICP processing thread (heavy computation)
+        m_process_thread = std::thread(&LocalizerNode::icpProcessLoop, this);
+    }
+    
+    ~LocalizerNode()
+    {
+        m_running = false;
+        m_cv.notify_all();
+        if (m_process_thread.joinable()) {
+            m_process_thread.join();
+        }
+        RCLCPP_INFO(this->get_logger(), "Localizer Node Shutdown");
     }
 
     void loadParameters()
@@ -103,33 +128,55 @@ public:
         m_localizer_config.refine_max_iteration = config["refine_max_iteration"].as<int>();
         m_localizer_config.refine_score_thresh = config["refine_score_thresh"].as<double>();
     }
-    void timerCB()
+    
+    // Lightweight timer callback - only handles TF broadcasting
+    void tfTimerCB()
     {
         if (!m_state.message_received)
-            return;
-
-        rclcpp::Duration diff = rclcpp::Clock().now() - m_state.last_send_tf_time;
-
-        bool update_tf = diff.seconds() > (1.0 / m_config.update_hz) && m_state.message_received;
-
-        if (!update_tf)
         {
-            sendBroadCastTF(m_state.last_message_time);
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                "Waiting for message from fastlio2 (body_cloud + lio_odom)...");
             return;
         }
-
-        m_state.last_send_tf_time = rclcpp::Clock().now();
-
+        
+        // Always broadcast TF at high rate
+        sendBroadCastTF(m_state.last_message_time);
+    }
+    
+    // ICP processing loop runs in separate thread
+    void icpProcessLoop()
+    {
+        while (m_running) {
+            // Wait for signal or timeout
+            {
+                std::unique_lock<std::mutex> lock(m_cv_mutex);
+                auto wait_time = std::chrono::duration<double>(1.0 / m_config.update_hz);
+                m_cv.wait_for(lock, wait_time, [this]() {
+                    return !m_running || m_state.new_data_available;
+                });
+            }
+            
+            if (!m_running) break;
+            
+            // Process ICP alignment
+            processICP();
+        }
+    }
+    
+    void processICP()
+    {
+        if (!m_state.message_received) return;
+        
         M4F initial_guess = M4F::Identity();
         if (m_state.service_received)
         {
-            std::lock_guard<std::mutex>(m_state.service_mutex);
+            std::lock_guard<std::mutex> lock(m_state.service_mutex);
             initial_guess = m_state.initial_guess;
-            // m_state.service_received = false;
+            RCLCPP_INFO(this->get_logger(), "Using user-provided initial guess from relocalize service");
         }
         else
         {
-            std::lock_guard<std::mutex>(m_state.message_mutex);
+            std::lock_guard<std::mutex> lock(m_state.message_mutex);
             initial_guess.block<3, 3>(0, 0) = (m_state.last_offset_r * m_state.last_r).cast<float>();
             initial_guess.block<3, 1>(0, 3) = (m_state.last_offset_r * m_state.last_t + m_state.last_offset_t).cast<float>();
         }
@@ -138,34 +185,38 @@ public:
         V3D current_local_t;
         builtin_interfaces::msg::Time current_time;
         {
-            std::lock_guard<std::mutex>(m_state.message_mutex);
+            std::lock_guard<std::mutex> lock(m_state.message_mutex);
             current_local_r = m_state.last_r;
             current_local_t = m_state.last_t;
             current_time = m_state.last_message_time;
             m_localizer->setInput(m_state.last_cloud);
+            m_state.new_data_available = false;
         }
 
         bool result = m_localizer->align(initial_guess);
+        RCLCPP_INFO(this->get_logger(), "ICP align result: %s, input cloud size: %zu", 
+            result ? "SUCCESS" : "FAILED", m_state.last_cloud->size());
         if (result)
         {
             M3D map_body_r = initial_guess.block<3, 3>(0, 0).cast<double>();
             V3D map_body_t = initial_guess.block<3, 1>(0, 3).cast<double>();
+            
+            std::lock_guard<std::mutex> lock(m_state.message_mutex);
             m_state.last_offset_r = map_body_r * current_local_r.transpose();
             m_state.last_offset_t = -map_body_r * current_local_r.transpose() * current_local_t + map_body_t;
             if (!m_state.localize_success && m_state.service_received)
             {
-                std::lock_guard<std::mutex>(m_state.service_mutex);
+                std::lock_guard<std::mutex> slock(m_state.service_mutex);
                 m_state.localize_success = true;
                 m_state.service_received = false;
             }
         }
-        sendBroadCastTF(current_time);
         publishMapCloud(current_time);
     }
+
     void syncCB(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg, const nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg)
     {
-
-        std::lock_guard<std::mutex>(m_state.message_mutex);
+        std::lock_guard<std::mutex> lock(m_state.message_mutex);
 
         pcl::fromROSMsg(*cloud_msg, *m_state.last_cloud);
 
@@ -178,11 +229,15 @@ public:
                              odom_msg->pose.pose.position.y,
                              odom_msg->pose.pose.position.z);
         m_state.last_message_time = cloud_msg->header.stamp;
+        m_state.new_data_available = true;
         if (!m_state.message_received)
         {
             m_state.message_received = true;
             m_config.local_frame = odom_msg->header.frame_id;
         }
+        
+        // Notify ICP thread
+        m_cv.notify_one();
     }
 
     void sendBroadCastTF(builtin_interfaces::msg::Time &time)
@@ -213,6 +268,9 @@ public:
         float roll = request->roll;
         float pitch = request->pitch;
 
+        RCLCPP_INFO(this->get_logger(), "Relocalize request: pcd=%s, x=%.3f, y=%.3f, z=%.3f, yaw=%.3f, roll=%.3f, pitch=%.3f",
+            pcd_path.c_str(), x, y, z, yaw, roll, pitch);
+
         if (!std::filesystem::exists(pcd_path))
         {
             response->success = false;
@@ -224,6 +282,7 @@ public:
         Eigen::AngleAxisd roll_angle = Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX());
         Eigen::AngleAxisd pitch_angle = Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY());
         bool load_flag = m_localizer->loadMap(pcd_path);
+        RCLCPP_INFO(this->get_logger(), "Map load result: %s", load_flag ? "SUCCESS" : "FAILED");
         if (!load_flag)
         {
             response->success = false;
@@ -237,10 +296,11 @@ public:
             m_state.initial_guess.block<3, 1>(0, 3) = V3F(x, y, z);
             m_state.service_received = true;
             m_state.localize_success = false;
+            RCLCPP_INFO(this->get_logger(), "Initial guess set: service_received=true, localize_success=false");
         }
 
         response->success = true;
-        response->message = "relocalize success";
+        response->message = "relocalize service call accepted, waiting for ICP alignment in timerCB";
         return;
     }
 
@@ -275,17 +335,19 @@ private:
     std::shared_ptr<ICPLocalizer> m_localizer;
     message_filters::Subscriber<sensor_msgs::msg::PointCloud2> m_cloud_sub;
     message_filters::Subscriber<nav_msgs::msg::Odometry> m_odom_sub;
-    rclcpp::TimerBase::SharedPtr m_timer;
+    rclcpp::TimerBase::SharedPtr m_tf_timer;
     std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::PointCloud2, nav_msgs::msg::Odometry>>> m_sync;
     std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
     rclcpp::Service<interface::srv::Relocalize>::SharedPtr m_reloc_srv;
     rclcpp::Service<interface::srv::IsValid>::SharedPtr m_reloc_check_srv;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_map_cloud_pub;
+    
+    // Thread management for async ICP processing
+    std::thread m_process_thread;
+    std::atomic<bool> m_running;
+    std::mutex m_cv_mutex;
+    std::condition_variable m_cv;
 };
-int main(int argc, char **argv)
-{
-    rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<LocalizerNode>());
-    rclcpp::shutdown();
-    return 0;
-}
+
+// Register as composed node
+RCLCPP_COMPONENTS_REGISTER_NODE(LocalizerNode)

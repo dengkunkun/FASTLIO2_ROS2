@@ -41,13 +41,13 @@ def generate_launch_description():
                     }
                 ],
             ),
-            launch_ros.actions.Node(
-                package="rviz2",
-                namespace="localizer",
-                executable="rviz2",
-                name="rviz2",
-                output="screen",
-                arguments=["-d", rviz_cfg.perform(launch.LaunchContext())],
-            )
+            # launch_ros.actions.Node(
+            #     package="rviz2",
+            #     namespace="localizer",
+            #     executable="rviz2",
+            #     name="rviz2",
+            #     output="screen",
+            #     arguments=["-d", rviz_cfg.perform(launch.LaunchContext())],
+            # )
         ]
     )

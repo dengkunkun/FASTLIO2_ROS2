@@ -42,12 +42,35 @@ include_directories(
 set(SRC_LIST src/pgos/commons.cpp
              src/pgos/simple_pgo.cpp)
 
-add_executable(pgo_node src/pgo_node.cpp ${SRC_LIST})
-ament_target_dependencies(pgo_node rclcpp std_msgs sensor_msgs nav_msgs message_filters pcl_conversions tf2_ros geometry_msgs visualization_msgs interface GTSAM)
-target_link_libraries(pgo_node ${PCL_LIBRARIES} gtsam yaml-cpp)
+# Create shared library for composed node
+add_library(pgo_component SHARED src/pgo_node.cpp ${SRC_LIST})
+ament_target_dependencies(pgo_component 
+  rclcpp 
+  rclcpp_components
+  std_msgs 
+  sensor_msgs 
+  nav_msgs 
+  message_filters 
+  pcl_conversions 
+  tf2_ros 
+  geometry_msgs 
+  visualization_msgs 
+  interface 
+  GTSAM
+)
+target_link_libraries(pgo_component ${PCL_LIBRARIES} gtsam yaml-cpp)
 
+# Register as composed node component
+rclcpp_components_register_node(pgo_component
+  PLUGIN "PGONode"
+  EXECUTABLE pgo_node
+)
 
-install(TARGETS pgo_node DESTINATION lib/${PROJECT_NAME})
+install(TARGETS pgo_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})
