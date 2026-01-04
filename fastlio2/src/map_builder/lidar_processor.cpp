@@ -1,5 +1,7 @@
 #include "lidar_processor.h"
 
+#include <iostream>
+
 LidarProcessor::LidarProcessor(Config &config, std::shared_ptr<IESKF> kf) : m_config(config), m_kf(kf)
 {
     m_ikdtree = std::make_shared<KD_TREE<PointType>>();
@@ -158,6 +160,16 @@ void LidarProcessor::initCloudMap(PointVec &point_vec)
 
 void LidarProcessor::process(SyncPackage &package)
 {
+    if (!package.cloud || package.cloud->empty())
+    {
+        return;
+    }
+    constexpr size_t kMaxInputPoints = 800000;
+    if (package.cloud->size() > kMaxInputPoints)
+    {
+        std::cerr << "[LidarProcessor] Cloud size " << package.cloud->size() << " exceeds cap " << kMaxInputPoints << ", drop frame" << std::endl;
+        return;
+    }
     // m_kf->setLossFunction([&](State &s, SharedState &d)
     //                       { updateLossFunc(s, d); });
     // m_kf->setStopFunction([&](const V21D &delta) -> bool

@@ -181,6 +181,13 @@ public:
         if (!m_state_data.lidar_pushed)
         {
             m_package.cloud = m_state_data.lidar_buffer.front().second;
+            if (m_package.cloud->empty())
+            {
+                RCLCPP_WARN(this->get_logger(), "Lidar cloud empty, drop frame");
+                m_state_data.lidar_buffer.pop_front();
+                m_state_data.lidar_pushed = false;
+                return false;
+            }
             std::sort(m_package.cloud->points.begin(), m_package.cloud->points.end(), [](PointType &p1, PointType &p2)
                       { return p1.curvature < p2.curvature; });
             m_package.cloud_start_time = m_state_data.lidar_buffer.front().first;
