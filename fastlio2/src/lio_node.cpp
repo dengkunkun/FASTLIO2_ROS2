@@ -7,7 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
-// #include <filesystem>
+#include <filesystem>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
@@ -23,6 +23,9 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <yaml-cpp/yaml.h>
+
+// ResetMapping service
+#include "interface/srv/reset_mapping.hpp"
 
 // For component registration
 #include <rclcpp_components/register_node_macro.hpp>
@@ -41,11 +44,13 @@ struct StateData
     bool lidar_pushed = false;
     std::mutex imu_mutex;
     std::mutex lidar_mutex;
+    std::mutex reset_mutex;  // 重置操作互斥锁
     double last_lidar_time = -1.0;
     double last_imu_time = -1.0;
     std::deque<IMUData> imu_buffer;
     std::deque<std::pair<double, pcl::PointCloud<pcl::PointXYZINormal>::Ptr>> lidar_buffer;
     nav_msgs::msg::Path path;
+    bool reset_pending = false;  // 是否有待处理的重置请求
 };
 
 class LIONode : public rclcpp::Node
@@ -66,6 +71,11 @@ public:
         m_path_pub = this->create_publisher<nav_msgs::msg::Path>("lio_path", 10000);
         m_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("lio_odom", 10000);
         m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+
+        // ResetMapping 服务
+        m_reset_srv = this->create_service<interface::srv::ResetMapping>(
+            "reset_mapping",
+            std::bind(&LIONode::resetMappingCB, this, std::placeholders::_1, std::placeholders::_2));
 
         m_state_data.path.poses.clear();
         m_state_data.path.header.frame_id = m_node_config.world_frame;
@@ -277,6 +287,16 @@ public:
             
             if (!m_running) break;
             
+            // 检查是否有待处理的重置请求
+            {
+                std::lock_guard<std::mutex> lock(m_state_data.reset_mutex);
+                if (m_state_data.reset_pending)
+                {
+                    // 重置进行中，跳过本次处理
+                    continue;
+                }
+            }
+            
             // Process available data
             processOnce();
         }
@@ -320,6 +340,101 @@ public:
         processOnce();
     }
 
+    /**
+     * @brief ResetMapping 服务回调
+     * @details 处理重置建图请求，支持：
+     *   1. 固定点重建：指定初始位姿，从零开始建图
+     *   2. 已有地图继续建图：加载 PCD 作为初始地图
+     */
+    void resetMappingCB(
+        const std::shared_ptr<interface::srv::ResetMapping::Request> request,
+        std::shared_ptr<interface::srv::ResetMapping::Response> response)
+    {
+        RCLCPP_INFO(this->get_logger(), "ResetMapping request received");
+        RCLCPP_INFO(this->get_logger(), "  Pose: x=%.3f, y=%.3f, z=%.3f, roll=%.3f, pitch=%.3f, yaw=%.3f",
+            request->x, request->y, request->z, request->roll, request->pitch, request->yaw);
+        RCLCPP_INFO(this->get_logger(), "  Options: load_map=%d, reuse_bias=%d, clear_path=%d",
+            request->load_map, request->reuse_bias, request->clear_path);
+
+        // 检查地图文件是否存在（如果需要加载）
+        if (request->load_map && !request->map_pcd_path.empty())
+        {
+            if (!std::filesystem::exists(request->map_pcd_path))
+            {
+                response->success = false;
+                response->message = "Map PCD file not found: " + request->map_pcd_path;
+                RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+                return;
+            }
+            RCLCPP_INFO(this->get_logger(), "  Map path: %s", request->map_pcd_path.c_str());
+        }
+
+        // 设置重置标志，暂停处理循环
+        {
+            std::lock_guard<std::mutex> lock(m_state_data.reset_mutex);
+            m_state_data.reset_pending = true;
+        }
+
+        // 等待处理循环暂停（最多等待 500ms）
+        std::this_thread::sleep_for(100ms);
+
+        // 清空数据缓冲区
+        {
+            std::lock_guard<std::mutex> imu_lock(m_state_data.imu_mutex);
+            std::lock_guard<std::mutex> lidar_lock(m_state_data.lidar_mutex);
+            m_state_data.imu_buffer.clear();
+            m_state_data.lidar_buffer.clear();
+            m_state_data.lidar_pushed = false;
+            m_state_data.last_imu_time = -1.0;
+            m_state_data.last_lidar_time = -1.0;
+        }
+
+        // 构建重置请求
+        ResetRequest reset_req;
+
+        // 计算旋转矩阵 (ZYX 欧拉角: yaw-pitch-roll)
+        Eigen::AngleAxisd yaw_angle(request->yaw, Eigen::Vector3d::UnitZ());
+        Eigen::AngleAxisd pitch_angle(request->pitch, Eigen::Vector3d::UnitY());
+        Eigen::AngleAxisd roll_angle(request->roll, Eigen::Vector3d::UnitX());
+        reset_req.r_wi = (yaw_angle * pitch_angle * roll_angle).toRotationMatrix();
+        reset_req.t_wi = V3D(request->x, request->y, request->z);
+
+        reset_req.load_map = request->load_map;
+        reset_req.map_path = request->map_pcd_path;
+        reset_req.voxel_size = 0.0;  // 使用地图原始分辨率
+        reset_req.reuse_bias = request->reuse_bias;
+
+        // 执行重置
+        bool success = m_builder->reset(reset_req);
+
+        // 清除轨迹（如果需要）
+        if (success && request->clear_path)
+        {
+            m_state_data.path.poses.clear();
+            RCLCPP_INFO(this->get_logger(), "Path history cleared");
+        }
+
+        // 恢复处理循环
+        {
+            std::lock_guard<std::mutex> lock(m_state_data.reset_mutex);
+            m_state_data.reset_pending = false;
+        }
+
+        // 设置响应
+        if (success)
+        {
+            response->success = true;
+            response->message = "Reset mapping successful";
+            RCLCPP_INFO(this->get_logger(), "ResetMapping completed successfully");
+        }
+        else
+        {
+            response->success = false;
+            response->message = "Reset mapping failed";
+            RCLCPP_ERROR(this->get_logger(), "ResetMapping failed");
+        }
+    }
+
 private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr m_lidar_sub;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr m_imu_sub;
@@ -328,6 +443,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_world_cloud_pub;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr m_path_pub;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr m_odom_pub;
+
+    rclcpp::Service<interface::srv::ResetMapping>::SharedPtr m_reset_srv;
 
     rclcpp::TimerBase::SharedPtr m_timer;
     StateData m_state_data;

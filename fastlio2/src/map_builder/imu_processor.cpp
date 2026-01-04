@@ -130,3 +130,25 @@ void IMUProcessor::undistort(SyncPackage &package)
         }
     }
 }
+
+void IMUProcessor::reset(bool reuse_bias)
+{
+    // 保存当前偏置估计值（如果需要复用）
+    V3D saved_ba = m_kf->x().ba;
+    V3D saved_bg = m_kf->x().bg;
+
+    // 清空缓存
+    m_imu_cache.clear();
+    m_poses_cache.clear();
+    m_last_acc.setZero();
+    m_last_gyro.setZero();
+    m_last_propagate_end_time = -1.0;
+    m_last_imu = IMUData();
+
+    // 恢复偏置（如果需要）
+    if (reuse_bias)
+    {
+        m_kf->x().ba = saved_ba;
+        m_kf->x().bg = saved_bg;
+    }
+}

@@ -287,3 +287,56 @@ CloudType::Ptr LidarProcessor::transformCloud(CloudType::Ptr inp, const M3D &r, 
     pcl::transformPointCloud(*inp, *ret, transform);
     return ret;
 }
+
+void LidarProcessor::reset()
+{
+    // 重建 KD-Tree
+    m_ikdtree = std::make_shared<KD_TREE<PointType>>();
+    m_ikdtree->set_downsample_param(m_config.map_resolution);
+
+    // 重置 LocalMap
+    m_local_map.initialed = false;
+    m_local_map.cub_to_rm.clear();
+
+    // 清空点云缓存
+    m_cloud_down_lidar->clear();
+    m_cloud_down_world->clear();
+    m_effect_cloud_lidar->clear();
+    m_effect_norm_vec->clear();
+    m_norm_vec->clear();
+
+    // 重置点选择标志
+    std::fill(m_point_selected_flag.begin(), m_point_selected_flag.end(), false);
+}
+
+bool LidarProcessor::loadMapFromPCD(const std::string &pcd_path, double voxel_size)
+{
+    CloudType::Ptr cloud(new CloudType);
+
+    if (pcl::io::loadPCDFile<PointType>(pcd_path, *cloud) == -1)
+    {
+        std::cerr << "[LidarProcessor] Failed to load PCD file: " << pcd_path << std::endl;
+        return false;
+    }
+
+    std::cout << "[LidarProcessor] Loaded " << cloud->size() << " points from " << pcd_path << std::endl;
+
+    // 可选体素滤波以减少点数
+    if (voxel_size > 0.0)
+    {
+        pcl::VoxelGrid<PointType> voxel_filter;
+        voxel_filter.setLeafSize(voxel_size, voxel_size, voxel_size);
+        voxel_filter.setInputCloud(cloud);
+        CloudType::Ptr cloud_filtered(new CloudType);
+        voxel_filter.filter(*cloud_filtered);
+        cloud = cloud_filtered;
+        std::cout << "[LidarProcessor] After voxel filter (" << voxel_size << "m): " << cloud->size() << " points" << std::endl;
+    }
+
+    // 初始化 KD-Tree
+    PointVec points(cloud->points.begin(), cloud->points.end());
+    initCloudMap(points);
+
+    std::cout << "[LidarProcessor] KD-Tree initialized with " << points.size() << " points" << std::endl;
+    return true;
+}
