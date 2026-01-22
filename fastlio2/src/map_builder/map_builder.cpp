@@ -53,7 +53,8 @@ bool MapBuilder::reset(const ResetRequest &req)
     // 4. 处理地图加载
     if (req.load_map && !req.map_path.empty())
     {
-        bool load_success = m_lidar_processor->loadMapFromPCD(req.map_path, req.voxel_size);
+        bool load_success = m_lidar_processor->loadMapFromPCD(
+            req.map_path, req.voxel_size, req.has_map_to_world_tf, req.r_w_m, req.t_w_m);
         if (!load_success)
         {
             std::cerr << "[MapBuilder] Failed to load map from: " << req.map_path << std::endl;

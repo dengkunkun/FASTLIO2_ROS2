@@ -22,6 +22,10 @@ struct ResetRequest
     bool load_map = false;       ///< 是否加载已有地图
     std::string map_path;        ///< PCD 地图路径
     double voxel_size = 0.0;     ///< 地图降采样体素大小（0表示不降采样）
+    // 当 map_path 指向的 PCD 位于 map_frame 时，需提供 T_world_map 用于变换到 world_frame。
+    bool has_map_to_world_tf = false;
+    M3D r_w_m = M3D::Identity(); ///< R_world_map
+    V3D t_w_m = V3D::Zero();     ///< t_world_map
 
     // 其他选项
     bool reuse_bias = false;     ///< 是否复用上一次的 IMU 偏置估计
@@ -53,6 +57,7 @@ public:
 private:
     Config m_config;
     BuilderStatus m_status;
+    bool m_has_prior_map_loaded = false;
     std::shared_ptr<IESKF> m_kf;
     std::shared_ptr<IMUProcessor> m_imu_processor;
     std::shared_ptr<LidarProcessor> m_lidar_processor;

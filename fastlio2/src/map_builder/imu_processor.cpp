@@ -51,8 +51,24 @@ bool IMUProcessor::initialize(SyncPackage &package)
 void IMUProcessor::undistort(SyncPackage &package)
 {
 
+    if (package.imus.empty())
+    {
+        return;
+    }
+
     m_imu_cache.clear();
-    m_imu_cache.push_back(m_last_imu);
+
+    // After reset(), m_last_propagate_end_time is invalid. Avoid using a dummy IMUData
+    // which would create an enormous dt (e.g. from 0.0 to current epoch time).
+    if (m_last_propagate_end_time >= 0.0)
+    {
+        m_imu_cache.push_back(m_last_imu);
+    }
+    else
+    {
+        m_last_imu = package.imus.front();
+        m_last_propagate_end_time = package.cloud_start_time;
+    }
     m_imu_cache.insert(m_imu_cache.end(), package.imus.begin(), package.imus.end());
 
     // const double imu_time_begin = m_imu_cache.front().time;

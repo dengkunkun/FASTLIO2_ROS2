@@ -1,0 +1,14 @@
+# LoadPGOSession.srv
+# Load an existing PGO mapping session (patches + poses.txt) so PGO can continue
+# adding new key-poses on top of an existing map and still do loop-closure optimization.
+
+# Directory that contains poses.txt and patches/.
+# Example: /home/firebot/firebot_dragon/maps/test_site_1
+string maps_path
+
+# Whether to load patches/poses.txt.
+bool load_patches
+
+---
+bool success
+string message

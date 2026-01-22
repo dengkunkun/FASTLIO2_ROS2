@@ -321,7 +321,10 @@ void LidarProcessor::reset()
     std::fill(m_point_selected_flag.begin(), m_point_selected_flag.end(), false);
 }
 
-bool LidarProcessor::loadMapFromPCD(const std::string &pcd_path, double voxel_size)
+bool LidarProcessor::loadMapFromPCD(const std::string &pcd_path, double voxel_size,
+                                    bool has_world_from_map_tf,
+                                    const M3D &r_w_m,
+                                    const V3D &t_w_m)
 {
     CloudType::Ptr cloud(new CloudType);
 
@@ -332,6 +335,25 @@ bool LidarProcessor::loadMapFromPCD(const std::string &pcd_path, double voxel_si
     }
 
     std::cout << "[LidarProcessor] Loaded " << cloud->size() << " points from " << pcd_path << std::endl;
+
+    if (has_world_from_map_tf)
+    {
+        for (auto &pt : cloud->points)
+        {
+            const V3D p_m(pt.x, pt.y, pt.z);
+            const V3D p_w = r_w_m * p_m + t_w_m;
+            pt.x = static_cast<float>(p_w.x());
+            pt.y = static_cast<float>(p_w.y());
+            pt.z = static_cast<float>(p_w.z());
+
+            const V3D n_m(pt.normal_x, pt.normal_y, pt.normal_z);
+            const V3D n_w = r_w_m * n_m;
+            pt.normal_x = static_cast<float>(n_w.x());
+            pt.normal_y = static_cast<float>(n_w.y());
+            pt.normal_z = static_cast<float>(n_w.z());
+        }
+        std::cout << "[LidarProcessor] Transformed map cloud from map_frame to world_frame using provided TF" << std::endl;
+    }
 
     // 可选体素滤波以减少点数
     if (voxel_size > 0.0)

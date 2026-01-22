@@ -110,7 +110,17 @@ bool ICPLocalizer::align(M4F &guess)
         return false;
     }
     guess = m_refine_icp.getFinalTransformation();
-    RCLCPP_INFO(m_logger, "[ICP] SUCCESS! Final t=(%.3f, %.3f, %.3f)", 
-             guess(0,3), guess(1,3), guess(2,3));
+    
+    // 诊断：输出 ICP 结果的完整姿态（包括 roll/pitch/yaw）
+    Eigen::Matrix3f R = guess.block<3, 3>(0, 0);
+    // 使用 atan2 计算欧拉角 (ZYX 顺序)
+    float pitch = std::asin(-R(2, 0));
+    float yaw = std::atan2(R(1, 0), R(0, 0));
+    float roll = std::atan2(R(2, 1), R(2, 2));
+    
+    RCLCPP_INFO(m_logger, "[ICP] SUCCESS! Final t=(%.3f, %.3f, %.3f) rpy=(%.1f, %.1f, %.1f)deg fitness=%.4f", 
+             guess(0,3), guess(1,3), guess(2,3),
+             roll * 180.0f / M_PI, pitch * 180.0f / M_PI, yaw * 180.0f / M_PI,
+             m_refine_icp.getFitnessScore());
     return true;
 }

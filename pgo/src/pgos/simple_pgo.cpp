@@ -209,3 +209,80 @@ void SimplePGO::smoothAndUpdate()
     m_r_offset = last_item.r_global * last_item.r_local.transpose();
     m_t_offset = last_item.t_global - m_r_offset * last_item.t_local;
 }
+
+void SimplePGO::appendLoopPair(const LoopPair &pair)
+{
+    m_cache_pairs.push_back(pair);
+    m_history_pairs.emplace_back(pair.target_id, pair.source_id);
+}
+
+bool SimplePGO::appendPriorKeyPose(const M3D &r_local, const V3D &t_local,
+                                   const M3D &r_global, const V3D &t_global,
+                                   double time, CloudType::Ptr body_cloud)
+{
+    const size_t idx = m_key_poses.size();
+    if (!body_cloud)
+    {
+        return false;
+    }
+
+    KeyPoseWithCloud item;
+    item.time = time;
+    item.r_local = r_local;
+    item.t_local = t_local;
+    item.r_global = r_global;
+    item.t_global = t_global;
+    item.body_cloud = body_cloud;
+    m_key_poses.push_back(item);
+
+    // Insert initial values into graph.
+    m_initial_values.insert(idx, gtsam::Pose3(gtsam::Rot3(r_global), gtsam::Point3(t_global)));
+
+    if (idx == 0)
+    {
+        // Strong prior for the first pose to anchor the map frame
+        gtsam::noiseModel::Diagonal::shared_ptr noise =
+            gtsam::noiseModel::Diagonal::Variances(gtsam::Vector6::Ones() * 1e-12);
+        m_graph.add(gtsam::PriorFactor<gtsam::Pose3>(
+            idx, gtsam::Pose3(gtsam::Rot3(r_global), gtsam::Point3(t_global)), noise));
+    }
+    else
+    {
+        // Add odom between-factor from local-frame poses.
+        // Since T_map_body = T_map_local * T_local_body, relative motion is invariant:
+        //   T_map_i^{-1} T_map_j == T_local_i^{-1} T_local_j
+        const KeyPoseWithCloud &last_item = m_key_poses[idx - 1];
+        const M3D r_between = last_item.r_local.transpose() * r_local;
+        const V3D t_between = last_item.r_local.transpose() * (t_local - last_item.t_local);
+        gtsam::noiseModel::Diagonal::shared_ptr noise =
+            gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-6).finished());
+        m_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            idx - 1, idx,
+            gtsam::Pose3(gtsam::Rot3(r_between), gtsam::Point3(t_between)),
+            noise));
+    }
+    return true;
+}
+
+void SimplePGO::commitAppendedPriors()
+{
+    if (m_initial_values.empty() && m_graph.size() == 0)
+    {
+        return;
+    }
+
+    // Update ISAM2 with the seeded graph
+    m_isam2->update(m_graph, m_initial_values);
+    m_isam2->update();
+
+    m_graph.resize(0);
+    m_initial_values.clear();
+
+    // Update offset based on the last pose (same logic as smoothAndUpdate())
+    if (!m_key_poses.empty())
+    {
+        const KeyPoseWithCloud &last_item = m_key_poses.back();
+        m_r_offset = last_item.r_global * last_item.r_local.transpose();
+        m_t_offset = last_item.t_global - m_r_offset * last_item.t_local;
+    }
+}

@@ -40,9 +40,9 @@ update_hz: 1.0                     # ICP定位更新频率(Hz)
 # 粗匹配使用较大的体素分辨率，快速收敛到大致位置
 rough_scan_resolution: 0.25        # 输入扫描的体素滤波分辨率(m)
 rough_map_resolution: 0.25         # 地图的体素滤波分辨率(m)
-rough_max_iteration: 5             # 粗匹配最大迭代次数
+rough_max_iteration: 10             # 粗匹配最大迭代次数
                                    # 增大可提高收敛成功率但耗时增加
-rough_score_thresh: 0.2            # 粗匹配fitness score阈值
+rough_score_thresh: 0.4            # 粗匹配fitness score阈值
                                    # 值越大越宽松，建议0.2-0.4
                                    # 如果环境有变化（如家具移动），建议增大到0.3-0.4
 

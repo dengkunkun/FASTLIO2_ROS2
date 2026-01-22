@@ -18,6 +18,8 @@
 
 #include <pcl_conversions/pcl_conversions.h>
 #include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -26,6 +28,7 @@
 
 // ResetMapping service
 #include "interface/srv/reset_mapping.hpp"
+#include "interface/srv/relocalize.hpp"
 
 // For component registration
 #include <rclcpp_components/register_node_macro.hpp>
@@ -37,6 +40,9 @@ struct NodeConfig
     std::string lidar_topic = "/livox/lidar";
     std::string body_frame = "body";
     std::string world_frame = "lidar";
+    // Optional global map frame (e.g. map_camera_init). When set, ResetMapping request pose
+    // is interpreted as map_frame -> body_frame and will be converted to world_frame -> body_frame.
+    std::string map_frame = "";
     bool print_time_cost = false;
 };
 struct StateData
@@ -72,10 +78,16 @@ public:
         m_odom_pub = this->create_publisher<nav_msgs::msg::Odometry>("lio_odom", 10000);
         m_tf_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
 
+        m_tf_buffer = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+        m_tf_listener = std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer);
+
         // ResetMapping 服务
         m_reset_srv = this->create_service<interface::srv::ResetMapping>(
             "reset_mapping",
             std::bind(&LIONode::resetMappingCB, this, std::placeholders::_1, std::placeholders::_2));
+
+        // 创建 localizer/reset_offset 服务客户端
+        m_reset_offset_client = this->create_client<interface::srv::Relocalize>("/localizer/reset_offset");
 
         m_state_data.path.poses.clear();
         m_state_data.path.header.frame_id = m_node_config.world_frame;
@@ -116,6 +128,15 @@ public:
         m_node_config.lidar_topic = config["lidar_topic"].as<std::string>();
         m_node_config.body_frame = config["body_frame"].as<std::string>();
         m_node_config.world_frame = config["world_frame"].as<std::string>();
+        if (config["map_frame"])
+        {
+            m_node_config.map_frame = config["map_frame"].as<std::string>();
+        }
+        else
+        {
+            // Default: treat ResetMapping request pose as world_frame -> body_frame
+            m_node_config.map_frame = "";
+        }
         m_node_config.print_time_cost = config["print_time_cost"].as<bool>();
 
         m_builder_config.lidar_filter_num = config["lidar_filter_num"].as<int>();
@@ -176,6 +197,8 @@ public:
 
     bool syncPackage()
     {
+        std::lock_guard<std::mutex> imu_lock(m_state_data.imu_mutex);
+        std::lock_guard<std::mutex> lidar_lock(m_state_data.lidar_mutex);
         if (m_state_data.imu_buffer.empty() || m_state_data.lidar_buffer.empty())
             return false;
         if (!m_state_data.lidar_pushed)
@@ -288,7 +311,11 @@ public:
             {
                 std::unique_lock<std::mutex> lock(m_cv_mutex);
                 m_cv.wait_for(lock, 20ms, [this]() {
-                    return !m_running || !m_state_data.lidar_buffer.empty();
+                    if (!m_running) {
+                        return true;
+                    }
+                    std::lock_guard<std::mutex> lidar_lock(m_state_data.lidar_mutex);
+                    return !m_state_data.lidar_buffer.empty();
                 });
             }
             
@@ -311,6 +338,7 @@ public:
 
     void processOnce()
     {
+        std::lock_guard<std::mutex> builder_lock(m_builder_mutex);
         if (!syncPackage())
             return;
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -382,43 +410,113 @@ public:
             m_state_data.reset_pending = true;
         }
 
-        // 等待处理循环暂停（最多等待 500ms）
-        std::this_thread::sleep_for(100ms);
-
-        // 清空数据缓冲区
+        // Critical section: block processing thread at a safe point, then clear buffers and reset MapBuilder / KD-tree.
+        bool success = false;
         {
-            std::lock_guard<std::mutex> imu_lock(m_state_data.imu_mutex);
-            std::lock_guard<std::mutex> lidar_lock(m_state_data.lidar_mutex);
-            m_state_data.imu_buffer.clear();
-            m_state_data.lidar_buffer.clear();
-            m_state_data.lidar_pushed = false;
-            m_state_data.last_imu_time = -1.0;
-            m_state_data.last_lidar_time = -1.0;
-        }
+            std::unique_lock<std::mutex> builder_lock(m_builder_mutex);
 
-        // 构建重置请求
-        ResetRequest reset_req;
+            // 清空数据缓冲区
+            {
+                std::lock_guard<std::mutex> imu_lock(m_state_data.imu_mutex);
+                std::lock_guard<std::mutex> lidar_lock(m_state_data.lidar_mutex);
+                m_state_data.imu_buffer.clear();
+                m_state_data.lidar_buffer.clear();
+                m_state_data.lidar_pushed = false;
+                m_state_data.last_imu_time = -1.0;
+                m_state_data.last_lidar_time = -1.0;
+            }
 
-        // 计算旋转矩阵 (ZYX 欧拉角: yaw-pitch-roll)
-        Eigen::AngleAxisd yaw_angle(request->yaw, Eigen::Vector3d::UnitZ());
-        Eigen::AngleAxisd pitch_angle(request->pitch, Eigen::Vector3d::UnitY());
-        Eigen::AngleAxisd roll_angle(request->roll, Eigen::Vector3d::UnitX());
-        reset_req.r_wi = (yaw_angle * pitch_angle * roll_angle).toRotationMatrix();
-        reset_req.t_wi = V3D(request->x, request->y, request->z);
+            // 构建重置请求
+            ResetRequest reset_req;
 
-        reset_req.load_map = request->load_map;
-        reset_req.map_path = request->map_pcd_path;
-        reset_req.voxel_size = 0.0;  // 使用地图原始分辨率
-        reset_req.reuse_bias = request->reuse_bias;
+            // 计算旋转矩阵 (ZYX 欧拉角: yaw-pitch-roll)
+            Eigen::AngleAxisd yaw_angle(request->yaw, Eigen::Vector3d::UnitZ());
+            Eigen::AngleAxisd pitch_angle(request->pitch, Eigen::Vector3d::UnitY());
+            Eigen::AngleAxisd roll_angle(request->roll, Eigen::Vector3d::UnitX());
+            const M3D req_r_mb = (yaw_angle * pitch_angle * roll_angle).toRotationMatrix();
+            const V3D req_t_mb(request->x, request->y, request->z);
 
-        // 执行重置
-        bool success = m_builder->reset(reset_req);
+            // Interpret request pose:
+            // - If map_frame is configured: request pose is map_frame -> body_frame.
+            //   We MUST convert it to world_frame -> body_frame using TF(world_frame <- map_frame).
+            //   If TF is not available, we fail the request to avoid inconsistent TF chains (map->local->body jitter).
+            // - Else: request pose is world_frame -> body_frame.
+            bool has_world_from_map_tf = false;
+            M3D r_w_m = M3D::Identity();
+            V3D t_w_m = V3D::Zero();
+            if (!m_node_config.map_frame.empty() && m_node_config.map_frame != m_node_config.world_frame)
+            {
+                try
+                {
+                    // Need T_world_map (world <- map) to compute T_world_body = T_world_map * T_map_body
+                    const auto tf_w_m = m_tf_buffer->lookupTransform(
+                        m_node_config.world_frame, m_node_config.map_frame, tf2::TimePointZero);
+                    const Eigen::Quaterniond q_w_m(
+                        tf_w_m.transform.rotation.w,
+                        tf_w_m.transform.rotation.x,
+                        tf_w_m.transform.rotation.y,
+                        tf_w_m.transform.rotation.z);
+                    r_w_m = q_w_m.toRotationMatrix();
+                    t_w_m = V3D(
+                        tf_w_m.transform.translation.x,
+                        tf_w_m.transform.translation.y,
+                        tf_w_m.transform.translation.z);
+                    has_world_from_map_tf = true;
 
-        // 清除轨迹（如果需要）
-        if (success && request->clear_path)
-        {
-            m_state_data.path.poses.clear();
-            RCLCPP_INFO(this->get_logger(), "Path history cleared");
+                    reset_req.r_wi = r_w_m * req_r_mb;
+                    reset_req.t_wi = r_w_m * req_t_mb + t_w_m;
+                    RCLCPP_INFO(this->get_logger(),
+                        "ResetMapping: converted request pose from map_frame='%s' to world_frame='%s'",
+                        m_node_config.map_frame.c_str(), m_node_config.world_frame.c_str());
+                }
+                catch (const std::exception &e)
+                {
+                    response->success = false;
+                    response->message = std::string("ResetMapping failed: TF lookup failed for '") +
+                        m_node_config.world_frame + "' <- '" + m_node_config.map_frame + "' (" + e.what() + ")";
+                    RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+
+                    // Restore processing loop
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_data.reset_mutex);
+                        m_state_data.reset_pending = false;
+                    }
+                    return;
+                }
+            }
+            else
+            {
+                // map_frame is empty or equals world_frame: treat request as world_frame -> body_frame
+                reset_req.r_wi = req_r_mb;
+                reset_req.t_wi = req_t_mb;
+                if (!m_node_config.map_frame.empty() && m_node_config.map_frame == m_node_config.world_frame)
+                {
+                    RCLCPP_INFO(this->get_logger(),
+                        "ResetMapping: map_frame equals world_frame ('%s'), using request directly.",
+                        m_node_config.world_frame.c_str());
+                }
+            }
+
+            reset_req.load_map = request->load_map;
+            reset_req.map_path = request->map_pcd_path;
+            reset_req.voxel_size = 0.0;  // 使用地图原始分辨率
+            reset_req.reuse_bias = request->reuse_bias;
+
+            // If map_frame is configured (common: map_camera_init) and differs from world_frame (common: camera_init),
+            // PGO/localizer exported map.pcd is in map_frame. Provide T_world_map to transform points into world_frame.
+            reset_req.has_map_to_world_tf = has_world_from_map_tf;
+            reset_req.r_w_m = r_w_m;
+            reset_req.t_w_m = t_w_m;
+
+            // 执行重置
+            success = m_builder->reset(reset_req);
+
+            // 清除轨迹（如果需要）
+            if (success && request->clear_path)
+            {
+                m_state_data.path.poses.clear();
+                RCLCPP_INFO(this->get_logger(), "Path history cleared");
+            }
         }
 
         // 恢复处理循环
@@ -433,6 +531,15 @@ public:
             response->success = true;
             response->message = "Reset mapping successful";
             RCLCPP_INFO(this->get_logger(), "ResetMapping completed successfully");
+            
+            // 自动调用 localizer/reset_offset 同步 localizer 状态
+            // IMPORTANT: reset_offset expects map_frame -> body_frame.
+            // ResetMapping request pose is defined in map_frame, so we forward request directly.
+            if (!m_node_config.map_frame.empty())
+            {
+                callResetOffset(request->x, request->y, request->z,
+                               request->roll, request->pitch, request->yaw);
+            }
         }
         else
         {
@@ -440,6 +547,46 @@ public:
             response->message = "Reset mapping failed";
             RCLCPP_ERROR(this->get_logger(), "ResetMapping failed");
         }
+    }
+
+    /**
+     * @brief 调用 localizer/reset_offset 服务同步 localizer 状态
+     */
+    void callResetOffset(double x, double y, double z, double roll, double pitch, double yaw)
+    {
+        if (!m_reset_offset_client->wait_for_service(std::chrono::milliseconds(500)))
+        {
+            RCLCPP_WARN(this->get_logger(), "localizer/reset_offset service not available, skipping");
+            return;
+        }
+        
+        auto req = std::make_shared<interface::srv::Relocalize::Request>();
+        req->x = x;
+        req->y = y;
+        req->z = z;
+        req->roll = roll;
+        req->pitch = pitch;
+        req->yaw = yaw;
+        req->pcd_path = "";  // reset_offset 不需要 pcd_path
+        
+        RCLCPP_INFO(this->get_logger(), "Calling localizer/reset_offset: x=%.3f, y=%.3f, z=%.3f, yaw=%.3f",
+            x, y, z, yaw);
+        
+        auto future = m_reset_offset_client->async_send_request(req,
+            [this](rclcpp::Client<interface::srv::Relocalize>::SharedFuture future) {
+                try {
+                    auto result = future.get();
+                    if (result->success) {
+                        RCLCPP_INFO(this->get_logger(), "localizer/reset_offset succeeded: %s", 
+                            result->message.c_str());
+                    } else {
+                        RCLCPP_WARN(this->get_logger(), "localizer/reset_offset failed: %s", 
+                            result->message.c_str());
+                    }
+                } catch (const std::exception& e) {
+                    RCLCPP_ERROR(this->get_logger(), "localizer/reset_offset exception: %s", e.what());
+                }
+            });
     }
 
 private:
@@ -452,6 +599,7 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr m_odom_pub;
 
     rclcpp::Service<interface::srv::ResetMapping>::SharedPtr m_reset_srv;
+    rclcpp::Client<interface::srv::Relocalize>::SharedPtr m_reset_offset_client;
 
     rclcpp::TimerBase::SharedPtr m_timer;
     StateData m_state_data;
@@ -460,7 +608,10 @@ private:
     Config m_builder_config;
     std::shared_ptr<IESKF> m_kf;
     std::shared_ptr<MapBuilder> m_builder;
+    std::mutex m_builder_mutex;
     std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
+    std::shared_ptr<tf2_ros::Buffer> m_tf_buffer;
+    std::shared_ptr<tf2_ros::TransformListener> m_tf_listener;
     
     // Thread management for async processing
     std::thread m_process_thread;

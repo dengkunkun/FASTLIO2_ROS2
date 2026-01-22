@@ -60,7 +60,7 @@ struct IMUData
     V3D acc;
     V3D gyro;
     double time;
-    IMUData() = default;
+    IMUData() : acc(V3D::Zero()), gyro(V3D::Zero()), time(0.0) {}
     IMUData(const V3D &a, const V3D &g, double &t) : acc(a), gyro(g), time(t) {}
 };
 
@@ -73,7 +73,7 @@ struct Pose
     V3D vel;
     V3D trans;
     M3D rot;
-    Pose() = default;
+    Pose() : offset(0.0), acc(V3D::Zero()), gyro(V3D::Zero()), vel(V3D::Zero()), trans(V3D::Zero()), rot(M3D::Identity()) {}
     Pose(double t, const V3D &a, const V3D &g, const V3D &v, const V3D &p, const M3D &r) : offset(t), acc(a), gyro(g), vel(v), trans(p), rot(r) {}
 };
 

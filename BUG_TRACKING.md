@@ -25,3 +25,11 @@ warning: 44     ./nptl/pthread_kill.c: No such file or directory
 #16 0x00007f4f592c3aa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
 #17 0x00007f4f59350c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
 (gdb)
+
+
+
+commit ac9eaaaacaef50013fdb431e47e70c7c683e34ac (HEAD -> feature/remap_on_exist_map)
+Author: dengkunkun <13109894430@163.com>
+Date:   Sun Jan 4 11:30:50 2026 +0800
+
+feat: add error handling for empty lidar clouds and limit point cloud size
