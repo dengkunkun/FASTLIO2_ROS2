@@ -41,6 +41,7 @@ struct NodeConfig
     std::string odom_topic = "/lio/odom";
     std::string map_frame = "map";
     std::string local_frame = "lidar";
+    bool publish_tf = true;  // 是否发布 TF，在 remap_mode 下可禁用避免与 localizer 冲突
 };
 
 struct NodeState
@@ -128,6 +129,11 @@ public:
                 m_node_config.map_frame = config["map_frame"].as<std::string>();
                 m_node_config.local_frame = config["local_frame"].as<std::string>();
 
+                if (config["publish_tf"])
+                {
+                    m_node_config.publish_tf = config["publish_tf"].as<bool>();
+                }
+
                 m_pgo_config.key_pose_delta_deg = config["key_pose_delta_deg"].as<double>();
                 m_pgo_config.key_pose_delta_trans = config["key_pose_delta_trans"].as<double>();
                 m_pgo_config.loop_search_radius = config["loop_search_radius"].as<double>();
@@ -170,11 +176,12 @@ public:
         this->get_parameter("min_loop_detect_duration", m_pgo_config.min_loop_detect_duration);
 
         RCLCPP_INFO(this->get_logger(),
-                    "PGO params: cloud_topic=%s odom_topic=%s map_frame=%s local_frame=%s",
+                    "PGO params: cloud_topic=%s odom_topic=%s map_frame=%s local_frame=%s publish_tf=%s",
                     m_node_config.cloud_topic.c_str(),
                     m_node_config.odom_topic.c_str(),
                     m_node_config.map_frame.c_str(),
-                    m_node_config.local_frame.c_str());
+                    m_node_config.local_frame.c_str(),
+                    m_node_config.publish_tf ? "true" : "false");
         RCLCPP_INFO(this->get_logger(),
                     "PGO config: key_pose_delta_deg=%.3f key_pose_delta_trans=%.3f loop_search_radius=%.3f",
                     m_pgo_config.key_pose_delta_deg,
@@ -224,6 +231,8 @@ public:
      */
     void tfTimerCB()
     {
+        if (!m_node_config.publish_tf) return;  // 如果禁用 TF 发布，直接返回
+        
         std::unique_lock<std::mutex> lock(m_pgo_mutex, std::try_to_lock);
         if (!lock.owns_lock()) return;
         if (m_pgo->keyPoses().empty()) return;
