@@ -19,6 +19,7 @@ add_definitions(-DMP_PROC_NUM=4)
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(interface REQUIRED)
@@ -44,11 +45,30 @@ set(SRC_LIST src/hba/commons.cpp
              src/hba/blam.cpp
              src/hba/hba.cpp)
 
-add_executable(hba_node src/hba_node.cpp ${SRC_LIST})
-ament_target_dependencies(hba_node rclcpp std_msgs sensor_msgs interface pcl_conversions GTSAM)
-target_link_libraries(hba_node ${PCL_LIBRARIES} gtsam yaml-cpp)
+# Create shared library for composed node
+add_library(hba_component SHARED src/hba_node.cpp ${SRC_LIST})
+ament_target_dependencies(hba_component 
+  rclcpp 
+  rclcpp_components
+  std_msgs 
+  sensor_msgs 
+  interface 
+  pcl_conversions 
+  GTSAM
+)
+target_link_libraries(hba_component ${PCL_LIBRARIES} gtsam yaml-cpp)
 
-install(TARGETS hba_node DESTINATION lib/${PROJECT_NAME})
+# Register as composed node component
+rclcpp_components_register_node(hba_component
+  PLUGIN "HBANode"
+  EXECUTABLE hba_node
+)
+
+install(TARGETS hba_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})

@@ -51,8 +51,24 @@ bool IMUProcessor::initialize(SyncPackage &package)
 void IMUProcessor::undistort(SyncPackage &package)
 {
 
+    if (package.imus.empty())
+    {
+        return;
+    }
+
     m_imu_cache.clear();
-    m_imu_cache.push_back(m_last_imu);
+
+    // After reset(), m_last_propagate_end_time is invalid. Avoid using a dummy IMUData
+    // which would create an enormous dt (e.g. from 0.0 to current epoch time).
+    if (m_last_propagate_end_time >= 0.0)
+    {
+        m_imu_cache.push_back(m_last_imu);
+    }
+    else
+    {
+        m_last_imu = package.imus.front();
+        m_last_propagate_end_time = package.cloud_start_time;
+    }
     m_imu_cache.insert(m_imu_cache.end(), package.imus.begin(), package.imus.end());
 
     // const double imu_time_begin = m_imu_cache.front().time;
@@ -128,5 +144,27 @@ void IMUProcessor::undistort(SyncPackage &package)
             if (it_pcl == package.cloud->points.begin())
                 break;
         }
+    }
+}
+
+void IMUProcessor::reset(bool reuse_bias)
+{
+    // 保存当前偏置估计值（如果需要复用）
+    V3D saved_ba = m_kf->x().ba;
+    V3D saved_bg = m_kf->x().bg;
+
+    // 清空缓存
+    m_imu_cache.clear();
+    m_poses_cache.clear();
+    m_last_acc.setZero();
+    m_last_gyro.setZero();
+    m_last_propagate_end_time = -1.0;
+    m_last_imu = IMUData();
+
+    // 恢复偏置（如果需要）
+    if (reuse_bias)
+    {
+        m_kf->x().ba = saved_ba;
+        m_kf->x().bg = saved_bg;
     }
 }

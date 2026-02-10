@@ -5,6 +5,8 @@
 #include <pcl/registration/icp.h>
 #include <pcl/filters/voxel_grid.h>
 
+#include <rclcpp/rclcpp.hpp>
+
 struct ICPConfig
 {
     double refine_scan_resolution = 0.1;
@@ -21,7 +23,7 @@ struct ICPConfig
 class ICPLocalizer
 {
 public:
-    ICPLocalizer(const ICPConfig &config);
+    ICPLocalizer(const ICPConfig &config, rclcpp::Logger logger);
     
     bool loadMap(const std::string &path);
     
@@ -35,6 +37,7 @@ public:
 
 private:
     ICPConfig m_config;
+    rclcpp::Logger m_logger;
     pcl::VoxelGrid<PointType> m_voxel_filter;
     pcl::IterativeClosestPoint<PointType, PointType> m_refine_icp;
     pcl::IterativeClosestPoint<PointType, PointType> m_rough_icp;

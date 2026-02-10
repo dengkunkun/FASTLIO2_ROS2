@@ -101,6 +101,20 @@ ros2 launch hba hba_launch.py
 ```shell
 ros2 service call /hba/refine_map interface/srv/RefineMap "{"maps_path": "your maps directory"}"
 ```
+新增
+```shell
+# 1. HBA 优化完成后，保存优化位姿
+ros2 service call /hba/save_poses interface/srv/SavePoses \
+  "{file_path: '/home/firebot/firebot_dragon/maps/test_site_2/optimized_poses.txt'}"
+
+# 2. 使用脚本生成优化后的地图
+cd ~/firebot_dragon/src/driver/fastlio_tf_bridge/script
+python3 map_optimized.py \
+  --maps_dir /home/firebot/firebot_dragon/maps/test_site_2 \
+  --optimized_poses_file /home/firebot/firebot_dragon/maps/test_site_2/optimized_poses.txt \
+  --output_pcd /home/firebot/firebot_dragon/maps/test_site_2/map_optimized.pcd
+
+```
 **如果需要调用优化服务，保存地图时需要设置save_patches为true**
 
 ## 特别感谢

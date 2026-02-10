@@ -8,6 +8,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions" )
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fexceptions")
 
+# ASAN support for debugging - uncomment to enable AddressSanitizer
+option(ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
+if(ENABLE_ASAN)
+  message(STATUS "AddressSanitizer enabled for fastlio2")
+  set(CMAKE_BUILD_TYPE "RelWithDebInfo")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
+endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-O3)
@@ -22,6 +32,7 @@ add_definitions(-DMP_PROC_NUM=2)
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -30,6 +41,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(interface REQUIRED)
 
 find_package(OpenMP QUIET)
 find_package(PCL REQUIRED)
@@ -49,15 +61,37 @@ set(SRC_LIST src/map_builder/commons.cpp
              src/map_builder/map_builder.cpp
              src/utils.cpp)
 
-add_executable(lio_node src/lio_node.cpp ${SRC_LIST})
-ament_target_dependencies(lio_node rclcpp std_msgs tf2 tf2_ros nav_msgs sensor_msgs livox_ros_driver2 pcl_conversions geometry_msgs)
-target_link_libraries(lio_node
+# Build as shared library for component loading
+add_library(lio_component SHARED src/lio_node.cpp ${SRC_LIST})
+ament_target_dependencies(lio_component 
+  rclcpp 
+  rclcpp_components
+  std_msgs 
+  tf2 
+  tf2_ros 
+  nav_msgs 
+  sensor_msgs 
+  livox_ros_driver2 
+  pcl_conversions 
+  geometry_msgs
+  interface
+)
+target_link_libraries(lio_component
   yaml-cpp
   ${PCL_LIBRARIES}
 )
 
+# Register component
+rclcpp_components_register_node(lio_component
+  PLUGIN "LIONode"
+  EXECUTABLE lio_node
+)
 
-install(TARGETS lio_node DESTINATION lib/${PROJECT_NAME})
+install(TARGETS lio_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})

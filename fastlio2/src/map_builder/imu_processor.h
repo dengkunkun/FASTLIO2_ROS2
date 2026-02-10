@@ -11,6 +11,13 @@ public:
 
     void undistort(SyncPackage &package);
 
+    /**
+     * @brief 重置 IMU 处理器状态
+     * @param reuse_bias 是否保留当前的 ba/bg 估计值
+     * @details 清空 IMU 缓存，重置时间戳，可选保留偏置估计
+     */
+    void reset(bool reuse_bias = false);
+
 private:
     Config m_config;
     std::shared_ptr<IESKF> m_kf;

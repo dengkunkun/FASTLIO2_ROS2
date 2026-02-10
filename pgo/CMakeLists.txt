@@ -1,15 +1,23 @@
 cmake_minimum_required(VERSION 3.8)
 project(pgo)
 
-set(CMAKE_BUILD_TYPE "Release")
+# set(CMAKE_BUILD_TYPE "Release")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fexceptions" )
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fexceptions")
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-O3)
   add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  add_compile_options(-O3)
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  add_compile_options(-g -O0)
 endif()
 
 # find dependencies
@@ -42,12 +50,35 @@ include_directories(
 set(SRC_LIST src/pgos/commons.cpp
              src/pgos/simple_pgo.cpp)
 
-add_executable(pgo_node src/pgo_node.cpp ${SRC_LIST})
-ament_target_dependencies(pgo_node rclcpp std_msgs sensor_msgs nav_msgs message_filters pcl_conversions tf2_ros geometry_msgs visualization_msgs interface GTSAM)
-target_link_libraries(pgo_node ${PCL_LIBRARIES} gtsam yaml-cpp)
+# Create shared library for composed node
+add_library(pgo_component SHARED src/pgo_node.cpp ${SRC_LIST})
+ament_target_dependencies(pgo_component 
+  rclcpp 
+  rclcpp_components
+  std_msgs 
+  sensor_msgs 
+  nav_msgs 
+  message_filters 
+  pcl_conversions 
+  tf2_ros 
+  geometry_msgs 
+  visualization_msgs 
+  interface 
+  GTSAM
+)
+target_link_libraries(pgo_component ${PCL_LIBRARIES} gtsam yaml-cpp)
 
+# Register as composed node component
+rclcpp_components_register_node(pgo_component
+  PLUGIN "PGONode"
+  EXECUTABLE pgo_node
+)
 
-install(TARGETS pgo_node DESTINATION lib/${PROJECT_NAME})
+install(TARGETS pgo_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY rviz DESTINATION share/${PROJECT_NAME})

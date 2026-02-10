@@ -57,12 +57,31 @@ public:
 
     void smoothAndUpdate();
 
+    void appendLoopPair(const LoopPair &pair);
+
+    // Append an existing (historical) keypose into the factor graph so that PGO can
+    // continue optimization on top of an existing map session.
+    // - r_local/t_local are the (local_frame) odom pose at mapping time.
+    // - r_global/t_global are the optimized pose in map_frame.
+    // - body_cloud is stored for later map/patch export.
+    // This will add a prior for the first appended pose and between-factors for subsequent ones
+    // (using the optimized global poses to keep the loaded session self-consistent).
+    // Call commitAppendedPriors() after appending all historical poses.
+    bool appendPriorKeyPose(const M3D &r_local, const V3D &t_local,
+                            const M3D &r_global, const V3D &t_global,
+                            double time, CloudType::Ptr body_cloud);
+
+    // Commit appended priors/between-factors into ISAM2 and update internal offset.
+    // Safe to call multiple times.
+    void commitAppendedPriors();
+
     CloudType::Ptr getSubMap(int idx, int half_range, double resolution);
     std::vector<std::pair<size_t, size_t>> &historyPairs() { return m_history_pairs; }
     std::vector<KeyPoseWithCloud> &keyPoses() { return m_key_poses; }
 
     M3D offsetR() { return m_r_offset; }
     V3D offsetT() { return m_t_offset; }
+    void updateConfig(const Config &config) { m_config = config; }
 
 private:
     Config m_config;

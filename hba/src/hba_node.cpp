@@ -8,9 +8,15 @@
 #include <chrono>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <pcl_conversions/pcl_conversions.h>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 
 #include "interface/srv/refine_map.hpp"
 #include "interface/srv/save_poses.hpp"
+
+// For component registration
+#include <rclcpp_components/register_node_macro.hpp>
 
 using namespace std::chrono_literals;
 void fromStr(const std::string &str, std::string &file_name, Pose &pose)
@@ -36,9 +42,11 @@ struct NodeConfig
 class HBANode : public rclcpp::Node
 {
 public:
-    HBANode() : Node("hba_node")
+    explicit HBANode(const rclcpp::NodeOptions & options)
+    : Node("hba_node", rclcpp::NodeOptions(options).enable_logger_service(true))
+    , m_running(true)
     {
-        RCLCPP_INFO(this->get_logger(), "HBA node started");
+        RCLCPP_INFO(this->get_logger(), "HBA node started (Composed)");
         loadParameters();
         m_hba = std::make_shared<HBA>(m_hba_config);
         m_voxel_grid.setLeafSize(m_node_config.scan_resolution, m_node_config.scan_resolution, m_node_config.scan_resolution);
@@ -48,8 +56,20 @@ public:
         m_save_poses_srv = this->create_service<interface::srv::SavePoses>(
             "save_poses",
             std::bind(&HBANode::savePosesCB, this, std::placeholders::_1, std::placeholders::_2));
-        m_timer = this->create_wall_timer(100ms, std::bind(&HBANode::mainCB, this));
         m_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map_points", 10);
+        
+        // Start optimization thread (heavy computation)
+        m_process_thread = std::thread(&HBANode::optimizeLoop, this);
+    }
+    
+    ~HBANode()
+    {
+        m_running = false;
+        m_cv.notify_all();
+        if (m_process_thread.joinable()) {
+            m_process_thread.join();
+        }
+        RCLCPP_INFO(this->get_logger(), "HBA Node Shutdown");
     }
 
     void loadParameters()
@@ -130,11 +150,21 @@ public:
         response->success = true;
         response->message = "load poses success!";
         m_do_optimize = true;
+        
+        // Notify optimization thread
+        m_cv.notify_one();
         return;
     }
 
     void savePosesCB(const std::shared_ptr<interface::srv::SavePoses::Request> request, std::shared_ptr<interface::srv::SavePoses::Response> response)
     {
+        // Check if optimization is in progress
+        if (m_optimizing) {
+            response->success = false;
+            response->message = "Optimization in progress, please wait until it finishes";
+            return;
+        }
+        
         std::lock_guard<std::mutex> lock(m_service_mutex);
         std::filesystem::path file_path(request->file_path);
         std::filesystem::path par_path = file_path.parent_path();
@@ -161,23 +191,37 @@ public:
         response->message = "save poses success!";
         return;
     }
-    void mainCB()
+    
+    // Optimization loop runs in separate thread
+    void optimizeLoop()
     {
-        {
-            std::lock_guard<std::mutex> lock(m_service_mutex);
-            if (!m_do_optimize)
-                return;
+        while (m_running) {
+            // Wait for optimization request or shutdown
+            {
+                std::unique_lock<std::mutex> lock(m_cv_mutex);
+                m_cv.wait(lock, [this]() {
+                    return !m_running || m_do_optimize;
+                });
+            }
+            
+            if (!m_running) break;
+            
+            // Perform optimization (don't hold lock during heavy computation)
+            if (!m_do_optimize) continue;
+            
+            m_optimizing = true;
             RCLCPP_WARN(this->get_logger(), "START OPTIMIZE");
             publishMap();
             for (size_t i = 0; i < m_hba_config.hba_iter; i++)
             {
+                if (!m_running) break;
                 RCLCPP_INFO(this->get_logger(), "======HBA ITER %lu START======", i + 1);
                 m_hba->optimize();
                 publishMap();
                 RCLCPP_INFO(this->get_logger(), "======HBA ITER %lu END========", i + 1);
             }
-
             m_do_optimize = false;
+            m_optimizing = false;
             RCLCPP_WARN(this->get_logger(), "END OPTIMIZE");
         }
     }
@@ -210,13 +254,14 @@ private:
     pcl::VoxelGrid<pcl::PointXYZI> m_voxel_grid;
     std::mutex m_service_mutex;
     bool m_do_optimize = false;
-    rclcpp::TimerBase::SharedPtr m_timer;
+    std::atomic<bool> m_optimizing{false};  // Track if optimization is in progress
+    
+    // Thread management for async optimization
+    std::thread m_process_thread;
+    std::atomic<bool> m_running;
+    std::mutex m_cv_mutex;
+    std::condition_variable m_cv;
 };
 
-int main(int argc, char **argv)
-{
-    rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<HBANode>());
-    rclcpp::shutdown();
-    return 0;
-}
+// Register as composed node
+RCLCPP_COMPONENTS_REGISTER_NODE(HBANode)
