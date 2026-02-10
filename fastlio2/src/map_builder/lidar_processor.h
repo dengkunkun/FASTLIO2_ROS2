@@ -39,6 +39,18 @@ public:
     void reset();
 
     /**
+     * @brief 设置是否冻结地图（不再添加新扫描点到ikd-Tree）
+     * @param freeze true=冻结（定位模式），false=正常增量建图
+     */
+    void setFreezeMap(bool freeze) { m_config.freeze_map = freeze; }
+    bool isFreezeMap() const { return m_config.freeze_map; }
+
+    /**
+     * @brief 获取 ikd-Tree 中的有效点数量（用于诊断监控）
+     */
+    int getIkdTreeSize() const { return m_ikdtree ? m_ikdtree->validnum() : 0; }
+
+    /**
      * @brief 从 PCD 文件加载地图作为初始地图
      * @param pcd_path PCD 文件路径
      * @param voxel_size 体素滤波大小，0 表示不滤波

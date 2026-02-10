@@ -33,6 +33,10 @@ public:
     ICPConfig &config() { return m_config; }
     CloudType::Ptr roughMap() { return m_rough_tgt; }
     CloudType::Ptr refineMap() { return m_refine_tgt; }
+    
+    // 诊断：获取最近一次 ICP 的 fitness scores
+    double lastRoughFitness() const { return m_last_rough_fitness; }
+    double lastRefineFitness() const { return m_last_refine_fitness; }
 
 
 private:
@@ -46,4 +50,8 @@ private:
     CloudType::Ptr m_refine_tgt;
     CloudType::Ptr m_rough_tgt;
     std::string m_pcd_path;
+    
+    // 诊断数据
+    double m_last_rough_fitness = 0.0;
+    double m_last_refine_fitness = 0.0;
 };

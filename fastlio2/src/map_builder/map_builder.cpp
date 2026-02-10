@@ -74,3 +74,38 @@ bool MapBuilder::reset(const ResetRequest &req)
 
     return true;
 }
+
+bool MapBuilder::loadAndFreezeMap(const std::string &pcd_path,
+                                bool has_map_to_world_tf,
+                                const M3D &r_w_m,
+                                const V3D &t_w_m)
+{
+    std::cout << "[MapBuilder] loadAndFreezeMap: Reloading ikd-Tree only (preserving IESKF/IMU state)" << std::endl;
+    std::cout << "[MapBuilder]   Current IESKF pose: t=(" << m_kf->x().t_wi.x() << ", " 
+              << m_kf->x().t_wi.y() << ", " << m_kf->x().t_wi.z() << ")" << std::endl;
+
+    // 仅重置 LidarProcessor 的 ikd-Tree（不碰 IESKF 和 IMU）
+    m_lidar_processor->reset();
+
+    // 加载 PCD 地图
+    bool load_success = m_lidar_processor->loadMapFromPCD(
+        pcd_path, 0.0, has_map_to_world_tf, r_w_m, t_w_m);
+    if (!load_success)
+    {
+        std::cerr << "[MapBuilder] loadAndFreezeMap: Failed to load map from: " << pcd_path << std::endl;
+        return false;
+    }
+
+    // 冻结地图
+    m_lidar_processor->setFreezeMap(true);
+
+    // 确保处于 MAPPING 状态
+    if (m_status != BuilderStatus::MAPPING)
+    {
+        std::cout << "[MapBuilder] loadAndFreezeMap: WARNING - status was not MAPPING, forcing MAPPING" << std::endl;
+        m_status = BuilderStatus::MAPPING;
+    }
+
+    std::cout << "[MapBuilder] loadAndFreezeMap: Complete. ikd-Tree reloaded + frozen. IESKF pose preserved." << std::endl;
+    return true;
+}

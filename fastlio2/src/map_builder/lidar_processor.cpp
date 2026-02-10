@@ -202,7 +202,9 @@ void LidarProcessor::process(SyncPackage &package)
     
     trimCloudMap();
     m_kf->update();
-    incrCloudMap();
+    if (!m_config.freeze_map) {
+        incrCloudMap();
+    }
 }
 
 void LidarProcessor::updateLossFunc(State &state, SharedState &share_data)

@@ -37,6 +37,46 @@ struct NodeConfig
     double update_hz = 1.0;
 };
 
+// ============================================================================
+// 诊断统计结构 (Diagnostic Statistics)
+// ============================================================================
+struct DiagnosticStats
+{
+    // ICP 质量追踪
+    uint64_t icp_total_count = 0;
+    uint64_t icp_success_count = 0;
+    uint64_t icp_fail_count = 0;
+    uint64_t icp_consecutive_fails = 0;
+    uint64_t icp_max_consecutive_fails = 0;
+    double icp_last_rough_score = 0.0;
+    double icp_last_refine_score = 0.0;
+    double icp_score_sum = 0.0;           // 累计 refine score (用于计算平均)
+    double icp_score_max = 0.0;           // 最大 refine score
+    double icp_score_min = 1e10;          // 最小 refine score
+    
+    // Offset 变化追踪
+    double max_delta_offset_t = 0.0;      // 最大单次 offset 平移变化量
+    double max_delta_offset_yaw = 0.0;    // 最大单次 offset yaw 变化量
+    double cumulative_offset_drift = 0.0; // 累积 offset 漂移
+    
+    // FAST-LIO2 里程计追踪
+    V3D first_odom_t = V3D::Zero();
+    double first_odom_yaw = 0.0;
+    bool first_odom_recorded = false;
+    double odom_total_distance = 0.0;
+    V3D prev_odom_t = V3D::Zero();
+    
+    // 时间追踪
+    std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_icp_success_time = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_diag_print_time = std::chrono::steady_clock::now();
+    double max_icp_gap_seconds = 0.0;     // 最长无成功 ICP 的间隔
+    
+    // 输入数据质量
+    size_t min_cloud_size = SIZE_MAX;
+    size_t max_cloud_size = 0;
+};
+
 struct NodeState
 {
     std::mutex message_mutex;
@@ -178,6 +218,9 @@ public:
     {
         if (!m_state.message_received) return;
         
+        m_diag.icp_total_count++;
+        auto icp_start_time = std::chrono::steady_clock::now();
+        
         M4F initial_guess = M4F::Identity();
         if (m_state.service_received)
         {
@@ -202,25 +245,73 @@ public:
         M3D current_local_r;
         V3D current_local_t;
         builtin_interfaces::msg::Time current_time;
+        size_t cloud_size = 0;
         {
             std::lock_guard<std::mutex> lock(m_state.message_mutex);
             current_local_r = m_state.last_r;
             current_local_t = m_state.last_t;
             current_time = m_state.last_message_time;
             m_localizer->setInput(m_state.last_cloud);
+            cloud_size = m_state.last_cloud->size();
             m_state.new_data_available = false;
         }
+        
+        // 跟踪输入点云质量
+        if (cloud_size < m_diag.min_cloud_size) m_diag.min_cloud_size = cloud_size;
+        if (cloud_size > m_diag.max_cloud_size) m_diag.max_cloud_size = cloud_size;
+        
+        // 跟踪里程计行驶距离
+        if (!m_diag.first_odom_recorded) {
+            m_diag.first_odom_t = current_local_t;
+            auto safeYaw0 = [](const M3D& R) -> double { return std::atan2(R(1,0), R(0,0)); };
+            m_diag.first_odom_yaw = safeYaw0(current_local_r);
+            m_diag.prev_odom_t = current_local_t;
+            m_diag.first_odom_recorded = true;
+        } else {
+            double step = (current_local_t - m_diag.prev_odom_t).head<2>().norm();
+            m_diag.odom_total_distance += step;
+            m_diag.prev_odom_t = current_local_t;
+        }
+
+        // 记录 ICP 前的 initial guess 位置（用于检测 ICP 修正量）
+        V3D initial_guess_t(initial_guess(0,3), initial_guess(1,3), initial_guess(2,3));
 
         bool result = m_localizer->align(initial_guess);
-        RCLCPP_INFO(this->get_logger(), "ICP align result: %s, input cloud size: %zu", 
-            result ? "SUCCESS" : "FAILED", m_state.last_cloud->size());
+        
+        auto icp_end_time = std::chrono::steady_clock::now();
+        double icp_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+            icp_end_time - icp_start_time).count() / 1000.0;
+        
+        // 读取 ICP fitness scores
+        double rough_score = m_localizer->lastRoughFitness();
+        double refine_score = m_localizer->lastRefineFitness();
+        
+        RCLCPP_INFO(this->get_logger(), 
+            "[ICP] result=%s cloud=%zu rough_score=%.4f refine_score=%.4f time=%.1fms", 
+            result ? "SUCCESS" : "FAILED", cloud_size, rough_score, refine_score, icp_duration_ms);
+        
         if (result)
         {
+            m_diag.icp_success_count++;
+            m_diag.icp_consecutive_fails = 0;
+            m_diag.icp_last_rough_score = rough_score;
+            m_diag.icp_last_refine_score = refine_score;
+            m_diag.icp_score_sum += refine_score;
+            if (refine_score > m_diag.icp_score_max) m_diag.icp_score_max = refine_score;
+            if (refine_score < m_diag.icp_score_min) m_diag.icp_score_min = refine_score;
+            
+            // 计算 ICP 对 initial guess 的修正量
+            V3D icp_result_t(initial_guess(0,3), initial_guess(1,3), initial_guess(2,3));
+            double icp_correction = (icp_result_t - initial_guess_t).head<2>().norm();
+            
+            // 计算距上次成功 ICP 的时间间隔
+            double gap_since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
+                icp_end_time - m_diag.last_icp_success_time).count() / 1000.0;
+            m_diag.last_icp_success_time = icp_end_time;
+            
             M3D map_body_r = initial_guess.block<3, 3>(0, 0).cast<double>();
             V3D map_body_t = initial_guess.block<3, 1>(0, 3).cast<double>();
             
-            // 使用 atan2 直接计算 yaw，避免 eulerAngles 在 ±180° 附近的奇异性
-            // yaw = atan2(R(1,0), R(0,0)) 是从旋转矩阵提取 yaw 的稳定方法
             auto safeYaw = [](const M3D& R) -> double {
                 return std::atan2(R(1, 0), R(0, 0));
             };
@@ -240,40 +331,51 @@ public:
             M3D new_offset_r = map_body_r * current_local_r.transpose();
             V3D new_offset_t = -map_body_r * current_local_r.transpose() * current_local_t + map_body_t;
             
-            // 计算 offset (map → local) 的 yaw，使用稳定的 atan2
             double offset_yaw = safeYaw(new_offset_r);
             
             // 计算 offset 变化量
             V3D delta_offset_t = new_offset_t - m_state.last_offset_t;
-            // 使用角度差的规范化方法，处理 ±180° 跳变
             double old_offset_yaw = safeYaw(m_state.last_offset_r);
             double delta_offset_yaw = offset_yaw - old_offset_yaw;
-            // 规范化到 [-pi, pi]
             while (delta_offset_yaw > M_PI) delta_offset_yaw -= 2.0 * M_PI;
             while (delta_offset_yaw < -M_PI) delta_offset_yaw += 2.0 * M_PI;
             
-            // 诊断日志：显示各个变换的值和变化量
+            double delta_offset_t_norm = delta_offset_t.head<2>().norm();
+            double delta_offset_yaw_deg = std::fabs(delta_offset_yaw) * 180.0 / M_PI;
+            
+            // 更新诊断统计
+            m_diag.cumulative_offset_drift += delta_offset_t_norm;
+            if (delta_offset_t_norm > m_diag.max_delta_offset_t) m_diag.max_delta_offset_t = delta_offset_t_norm;
+            if (delta_offset_yaw_deg > m_diag.max_delta_offset_yaw) m_diag.max_delta_offset_yaw = delta_offset_yaw_deg;
+            
+            // ===== 关键诊断日志 =====
+            // 检测大的 offset 跳变 (可能是 ICP 错误收敛)
+            if (delta_offset_t_norm > 0.05 || delta_offset_yaw_deg > 1.0) {
+                RCLCPP_WARN(this->get_logger(), 
+                    "[DRIFT_ALERT] Large offset change! dt_2d=%.4fm dyaw=%.3fdeg "
+                    "(refine_score=%.4f, icp_correction=%.4fm, gap=%.1fs)",
+                    delta_offset_t_norm, delta_offset_yaw_deg,
+                    refine_score, icp_correction, gap_since_last);
+            }
+            
+            // 标准诊断日志
             RCLCPP_INFO(this->get_logger(), 
-                "[DRIFT_DEBUG] ICP result (map->body): t=(%.3f,%.3f,%.3f) rpy=(%.1f,%.1f,%.1f)deg",
+                "[DRIFT_DEBUG] ICP(map->body): t=(%.3f,%.3f,%.3f) rpy=(%.1f,%.1f,%.1f)deg",
                 map_body_t.x(), map_body_t.y(), map_body_t.z(),
                 map_body_roll * 180.0 / M_PI, map_body_pitch * 180.0 / M_PI, map_body_yaw * 180.0 / M_PI);
             RCLCPP_INFO(this->get_logger(), 
-                "[DRIFT_DEBUG] LIO odom (local->body): t=(%.3f,%.3f,%.3f) yaw=%.1f deg",
+                "[DRIFT_DEBUG] LIO(local->body): t=(%.3f,%.3f,%.3f) yaw=%.1fdeg",
                 current_local_t.x(), current_local_t.y(), current_local_t.z(),
                 local_body_yaw * 180.0 / M_PI);
             RCLCPP_INFO(this->get_logger(), 
-                "[DRIFT_DEBUG] Offset (map->local): t=(%.3f,%.3f,%.3f) yaw=%.1f deg",
+                "[DRIFT_DEBUG] Offset(map->local): t=(%.3f,%.3f,%.3f) yaw=%.1fdeg | "
+                "delta: dt_2d=%.4fm dyaw=%.3fdeg | correction=%.4fm",
                 new_offset_t.x(), new_offset_t.y(), new_offset_t.z(),
-                offset_yaw * 180.0 / M_PI);
-            RCLCPP_INFO(this->get_logger(), 
-                "[DRIFT_DEBUG] Delta offset: dt=(%.4f,%.4f,%.4f) dyaw=%.3f deg",
-                delta_offset_t.x(), delta_offset_t.y(), delta_offset_t.z(),
-                delta_offset_yaw * 180.0 / M_PI);
+                offset_yaw * 180.0 / M_PI,
+                delta_offset_t_norm, delta_offset_yaw_deg, icp_correction);
             
             m_state.last_offset_r = new_offset_r;
             m_state.last_offset_t = new_offset_t;
-            // 保存计算 offset 时的参考 local 位姿
-            // 这样 TF 发布时可以正确计算增量
             m_state.offset_ref_local_r = current_local_r;
             m_state.offset_ref_local_t = current_local_t;
             
@@ -284,6 +386,71 @@ public:
                 m_state.service_received = false;
             }
         }
+        else
+        {
+            // ICP 失败统计
+            m_diag.icp_fail_count++;
+            m_diag.icp_consecutive_fails++;
+            if (m_diag.icp_consecutive_fails > m_diag.icp_max_consecutive_fails) {
+                m_diag.icp_max_consecutive_fails = m_diag.icp_consecutive_fails;
+            }
+            
+            double gap = std::chrono::duration_cast<std::chrono::milliseconds>(
+                icp_end_time - m_diag.last_icp_success_time).count() / 1000.0;
+            if (gap > m_diag.max_icp_gap_seconds) m_diag.max_icp_gap_seconds = gap;
+            
+            RCLCPP_WARN(this->get_logger(), 
+                "[ICP_FAIL] consecutive=%lu gap_since_success=%.1fs "
+                "rough_score=%.4f refine_score=%.4f cloud=%zu",
+                m_diag.icp_consecutive_fails, gap,
+                rough_score, refine_score, cloud_size);
+        }
+        
+        // 每30秒输出综合诊断报告
+        auto now = std::chrono::steady_clock::now();
+        double since_last_diag = std::chrono::duration_cast<std::chrono::seconds>(
+            now - m_diag.last_diag_print_time).count();
+        if (since_last_diag >= 30.0) {
+            m_diag.last_diag_print_time = now;
+            double uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                now - m_diag.start_time).count();
+            double success_rate = m_diag.icp_total_count > 0 ? 
+                (double)m_diag.icp_success_count / m_diag.icp_total_count * 100.0 : 0.0;
+            double avg_score = m_diag.icp_success_count > 0 ? 
+                m_diag.icp_score_sum / m_diag.icp_success_count : 0.0;
+            double drift_from_origin = (m_diag.prev_odom_t - m_diag.first_odom_t).head<2>().norm();
+            
+            RCLCPP_INFO(this->get_logger(),
+                "╔══════════════════════════════════════════════════════════════╗");
+            RCLCPP_INFO(this->get_logger(),
+                "║ [LOCALIZER DIAG] uptime=%.0fs  odom_distance=%.1fm          ║",
+                uptime, m_diag.odom_total_distance);
+            RCLCPP_INFO(this->get_logger(),
+                "║ ICP: total=%lu success=%lu fail=%lu rate=%.1f%%              ║",
+                m_diag.icp_total_count, m_diag.icp_success_count, 
+                m_diag.icp_fail_count, success_rate);
+            RCLCPP_INFO(this->get_logger(),
+                "║ ICP score: avg=%.4f min=%.4f max=%.4f last=%.4f     ║",
+                avg_score, 
+                m_diag.icp_score_min < 1e9 ? m_diag.icp_score_min : 0.0,
+                m_diag.icp_score_max, m_diag.icp_last_refine_score);
+            RCLCPP_INFO(this->get_logger(),
+                "║ Offset drift: cumulative=%.4fm max_single=%.4fm             ║",
+                m_diag.cumulative_offset_drift, m_diag.max_delta_offset_t);
+            RCLCPP_INFO(this->get_logger(),
+                "║ Offset yaw: max_single=%.3fdeg                              ║",
+                m_diag.max_delta_offset_yaw);
+            RCLCPP_INFO(this->get_logger(),
+                "║ Fails: max_consecutive=%lu max_gap=%.1fs                    ║",
+                m_diag.icp_max_consecutive_fails, m_diag.max_icp_gap_seconds);
+            RCLCPP_INFO(this->get_logger(),
+                "║ Cloud: min=%zu max=%zu  LIO_dist_from_origin=%.2fm          ║",
+                m_diag.min_cloud_size < SIZE_MAX ? m_diag.min_cloud_size : (size_t)0,
+                m_diag.max_cloud_size, drift_from_origin);
+            RCLCPP_INFO(this->get_logger(),
+                "╚══════════════════════════════════════════════════════════════╝");
+        }
+        
         publishMapCloud(current_time);
     }
 
@@ -531,6 +698,9 @@ private:
     std::atomic<bool> m_running;
     std::mutex m_cv_mutex;
     std::condition_variable m_cv;
+    
+    // 诊断统计
+    DiagnosticStats m_diag;
 };
 
 // Register as composed node

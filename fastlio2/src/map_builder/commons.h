@@ -48,6 +48,9 @@ struct Config
     int ieskf_max_iter = 5;
     bool gravity_align = true;
     bool esti_il = false;
+    bool freeze_map = false;  ///< 冻结ikd-Tree地图，不添加新扫描点（定位模式用）
+    bool localization_mode = false;  ///< 定位模式：自动在IESKF初始化后冻结地图（安全网）
+    int localization_freeze_delay_frames = 200;  ///< 定位模式延迟冻结帧数（约20秒@10Hz）
     M3D r_il = M3D::Identity();
     V3D t_il = V3D::Zero();
 
