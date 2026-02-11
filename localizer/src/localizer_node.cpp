@@ -35,6 +35,10 @@ struct NodeConfig
     std::string map_frame = "map";
     std::string local_frame = "lidar";
     double update_hz = 1.0;
+    
+    // ICP 结果过滤 - 防止 ICP 错误收敛导致的大跳变
+    double max_offset_jump_t = 0.3;      // 允许的最大单帧 offset 位移变化 (m)
+    double max_offset_jump_yaw = 5.0;    // 允许的最大单帧 offset yaw 变化 (deg)
 };
 
 // ============================================================================
@@ -99,6 +103,11 @@ struct NodeState
     M3D offset_ref_local_r = M3D::Identity();  // 计算 offset 时的 local_body_r
     V3D offset_ref_local_t = V3D::Zero();      // 计算 offset 时的 local_body_t
     
+    // ICP 结果过滤状态
+    bool has_valid_offset = false;              // 是否已有有效的 offset (第一次 ICP 后为 true)
+    uint64_t icp_reject_count = 0;              // 因 offset 跳变过大被拒绝的 ICP 结果计数
+    uint64_t icp_reject_consecutive = 0;        // 连续被拒绝的计数
+    
     // For async processing
     bool new_data_available = false;
 };
@@ -126,10 +135,6 @@ public:
         m_reloc_srv = this->create_service<interface::srv::Relocalize>("relocalize", std::bind(&LocalizerNode::relocCB, this, std::placeholders::_1, std::placeholders::_2));
 
         m_reloc_check_srv = this->create_service<interface::srv::IsValid>("relocalize_check", std::bind(&LocalizerNode::relocCheckCB, this, std::placeholders::_1, std::placeholders::_2));
-
-        // 重置偏移量服务 - 用于 ResetMapping 后同步 localizer 状态
-        m_reset_offset_srv = this->create_service<interface::srv::Relocalize>("reset_offset", 
-            std::bind(&LocalizerNode::resetOffsetCB, this, std::placeholders::_1, std::placeholders::_2));
 
         m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", 10);
 
@@ -178,6 +183,17 @@ public:
         m_localizer_config.refine_map_resolution = config["refine_map_resolution"].as<double>();
         m_localizer_config.refine_max_iteration = config["refine_max_iteration"].as<int>();
         m_localizer_config.refine_score_thresh = config["refine_score_thresh"].as<double>();
+        
+        // ICP 结果过滤参数 (可选, 有默认值)
+        if (config["max_offset_jump_t"]) {
+            m_config.max_offset_jump_t = config["max_offset_jump_t"].as<double>();
+        }
+        if (config["max_offset_jump_yaw"]) {
+            m_config.max_offset_jump_yaw = config["max_offset_jump_yaw"].as<double>();
+        }
+        RCLCPP_INFO(this->get_logger(), 
+            "[CONFIG] ICP offset filter: max_jump_t=%.3fm, max_jump_yaw=%.1fdeg",
+            m_config.max_offset_jump_t, m_config.max_offset_jump_yaw);
     }
     
     // Lightweight timer callback - only handles TF broadcasting
@@ -358,6 +374,43 @@ public:
                     refine_score, icp_correction, gap_since_last);
             }
             
+            // ===== ICP 结果过滤: 拒绝 offset 跳变过大的结果 =====
+            // 跳过检查的条件:
+            //   1. 首次获得有效 offset (has_valid_offset == false)
+            //   2. 刚通过 relocalize 服务设置了初始位姿
+            // 否则, 如果 offset 变化超过阈值, 拒绝此次 ICP 结果
+            bool skip_rejection_check = !m_state.has_valid_offset || m_state.service_received;
+            bool offset_rejected = false;
+            
+            if (!skip_rejection_check && 
+                (delta_offset_t_norm > m_config.max_offset_jump_t || 
+                 delta_offset_yaw_deg > m_config.max_offset_jump_yaw))
+            {
+                offset_rejected = true;
+                m_state.icp_reject_count++;
+                m_state.icp_reject_consecutive++;
+                
+                RCLCPP_WARN(this->get_logger(), 
+                    "[ICP_REJECT] Offset jump too large! dt_2d=%.4fm (max=%.3f) dyaw=%.3fdeg (max=%.1f) "
+                    "refine=%.4f | REJECTED (total=%lu consecutive=%lu)",
+                    delta_offset_t_norm, m_config.max_offset_jump_t,
+                    delta_offset_yaw_deg, m_config.max_offset_jump_yaw,
+                    refine_score,
+                    m_state.icp_reject_count, m_state.icp_reject_consecutive);
+                
+                // 如果连续拒绝过多次 (>10), 说明可能是真正的位置变化 (如手动搬运机器人)
+                // 此时接受 ICP 结果, 重置连续计数
+                if (m_state.icp_reject_consecutive > 10) {
+                    offset_rejected = false;
+                    RCLCPP_WARN(this->get_logger(), 
+                        "[ICP_REJECT] Too many consecutive rejections (%lu), accepting result as position may have truly changed",
+                        m_state.icp_reject_consecutive);
+                    m_state.icp_reject_consecutive = 0;
+                }
+            } else {
+                m_state.icp_reject_consecutive = 0;  // 正常结果, 重置连续拒绝计数
+            }
+            
             // 标准诊断日志
             RCLCPP_INFO(this->get_logger(), 
                 "[DRIFT_DEBUG] ICP(map->body): t=(%.3f,%.3f,%.3f) rpy=(%.1f,%.1f,%.1f)deg",
@@ -369,15 +422,19 @@ public:
                 local_body_yaw * 180.0 / M_PI);
             RCLCPP_INFO(this->get_logger(), 
                 "[DRIFT_DEBUG] Offset(map->local): t=(%.3f,%.3f,%.3f) yaw=%.1fdeg | "
-                "delta: dt_2d=%.4fm dyaw=%.3fdeg | correction=%.4fm",
+                "delta: dt_2d=%.4fm dyaw=%.3fdeg | correction=%.4fm | %s",
                 new_offset_t.x(), new_offset_t.y(), new_offset_t.z(),
                 offset_yaw * 180.0 / M_PI,
-                delta_offset_t_norm, delta_offset_yaw_deg, icp_correction);
+                delta_offset_t_norm, delta_offset_yaw_deg, icp_correction,
+                offset_rejected ? "REJECTED" : "ACCEPTED");
             
-            m_state.last_offset_r = new_offset_r;
-            m_state.last_offset_t = new_offset_t;
-            m_state.offset_ref_local_r = current_local_r;
-            m_state.offset_ref_local_t = current_local_t;
+            if (!offset_rejected) {
+                m_state.last_offset_r = new_offset_r;
+                m_state.last_offset_t = new_offset_t;
+                m_state.offset_ref_local_r = current_local_r;
+                m_state.offset_ref_local_t = current_local_t;
+                m_state.has_valid_offset = true;
+            }
             
             if (!m_state.localize_success && m_state.service_received)
             {
@@ -616,44 +673,6 @@ public:
         return;
     }
 
-    /**
-     * @brief 重置偏移量服务回调
-     * @details 在 ResetMapping 后调用此服务，使 localizer 的偏移量与新的 FASTLIO2 状态同步
-     *          传入的位姿应该是新的 map -> body 变换
-     */
-    void resetOffsetCB(const std::shared_ptr<interface::srv::Relocalize::Request> request, 
-                       std::shared_ptr<interface::srv::Relocalize::Response> response)
-    {
-        RCLCPP_INFO(this->get_logger(), "Reset offset request: x=%.3f, y=%.3f, z=%.3f, yaw=%.3f",
-            request->x, request->y, request->z, request->yaw);
-
-        // 计算新的偏移量：map_body = offset * local_body
-        // 所以 offset = map_body * local_body^(-1)
-        Eigen::AngleAxisd yaw_angle(request->yaw, Eigen::Vector3d::UnitZ());
-        Eigen::AngleAxisd roll_angle(request->roll, Eigen::Vector3d::UnitX());
-        Eigen::AngleAxisd pitch_angle(request->pitch, Eigen::Vector3d::UnitY());
-        M3D new_map_body_r = (yaw_angle * pitch_angle * roll_angle).toRotationMatrix();
-        V3D new_map_body_t(request->x, request->y, request->z);
-
-        {
-            std::lock_guard<std::mutex> lock(m_state.message_mutex);
-            // offset_r = map_body_r * local_body_r^T
-            // offset_t = map_body_t - offset_r * local_body_t
-            m_state.last_offset_r = new_map_body_r * m_state.last_r.transpose();
-            m_state.last_offset_t = new_map_body_t - m_state.last_offset_r * m_state.last_t;
-            
-            // 重置定位成功标志
-            m_state.localize_success = true;
-            m_state.service_received = false;
-        }
-
-        RCLCPP_INFO(this->get_logger(), "Offset reset completed. New offset_t=(%.3f, %.3f, %.3f)",
-            m_state.last_offset_t.x(), m_state.last_offset_t.y(), m_state.last_offset_t.z());
-
-        response->success = true;
-        response->message = "Offset reset successfully";
-    }
-
     void relocCheckCB(const std::shared_ptr<interface::srv::IsValid::Request> request, std::shared_ptr<interface::srv::IsValid::Response> response)
     {
         std::lock_guard<std::mutex> slock(m_state.service_mutex);
@@ -690,7 +709,6 @@ private:
     std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
     rclcpp::Service<interface::srv::Relocalize>::SharedPtr m_reloc_srv;
     rclcpp::Service<interface::srv::IsValid>::SharedPtr m_reloc_check_srv;
-    rclcpp::Service<interface::srv::Relocalize>::SharedPtr m_reset_offset_srv;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_map_cloud_pub;
     
     // Thread management for async ICP processing

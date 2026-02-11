@@ -20,10 +20,6 @@ body_frame: body                   # 机器人body坐标系名称，LiDAR安装�
 world_frame: camera_init           # 世界坐标系名称（里程计起点），也称为local_frame
                                    # 注意：这是FAST-LIO2的局部坐标系，启动时为原点
 
-# 可选：全局地图坐标系（由 localizer/pgo 发布）
-# 当设置后：/fastlio2/reset_mapping 请求的(x,y,z,roll,pitch,yaw)按 map_frame -> body_frame 解释，
-# fastlio2 会通过 TF(map_frame -> world_frame) 自动换算为 world_frame -> body_frame 再重置，避免位置“瞬移”。
-map_frame: map_camera_init
 
 # -----------------------------------------------------------------------------
 # 调试配置 (Debug Configuration)

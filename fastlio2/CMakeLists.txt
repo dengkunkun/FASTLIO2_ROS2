@@ -41,7 +41,6 @@ find_package(sensor_msgs REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(interface REQUIRED)
 
 find_package(OpenMP QUIET)
 find_package(PCL REQUIRED)
@@ -74,7 +73,6 @@ ament_target_dependencies(lio_component
   livox_ros_driver2 
   pcl_conversions 
   geometry_msgs
-  interface
 )
 target_link_libraries(lio_component
   yaml-cpp
