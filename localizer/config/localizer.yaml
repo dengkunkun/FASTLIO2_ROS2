@@ -30,9 +30,10 @@ local_frame: camera_init           # 局部坐标系名称（FAST-LIO2的world_f
 # -----------------------------------------------------------------------------
 # 更新频率配置 (Update Rate)
 # -----------------------------------------------------------------------------
-update_hz: 1.0                     # ICP定位更新频率(Hz)
+update_hz: 3.0                     # ICP定位更新频率(Hz)
                                    # 值越高响应越快但CPU占用越高
-                                   # 对于室内环境变化场景，建议0.5-2Hz
+                                   # 3Hz平衡精度和性能：每帧校正量更小，offset更稳定
+                                   # 建议2-5Hz，搭配EMA平滑使用
 
 # -----------------------------------------------------------------------------
 # 粗匹配ICP配置 (Rough ICP Configuration) - 第一阶段
@@ -50,24 +51,32 @@ rough_score_thresh: 0.4            # 粗匹配fitness score阈值
 # 精匹配ICP配置 (Refine ICP Configuration) - 第二阶段
 # -----------------------------------------------------------------------------
 # 精匹配使用较小的体素分辨率，精确优化位姿
-refine_scan_resolution: 0.1        # 输入扫描的体素滤波分辨率(m)
-refine_map_resolution: 0.1         # 地图的体素滤波分辨率(m)
-refine_max_iteration: 10           # 精匹配最大迭代次数
+refine_scan_resolution: 0.05       # 输入扫描的体素滤波分辨率(m)
+                                   # 0.05m提供更精细匹配，减少ICP收敛误差
+refine_map_resolution: 0.05        # 地图的体素滤波分辨率(m)
+refine_max_iteration: 20           # 精匹配最大迭代次数
+                                   # 20次迭代确保充分收敛，减少残余误差
 refine_score_thresh: 0.1           # 精匹配fitness score阈值
                                    # 值越大越宽松，建议0.1-0.2
 
 # -----------------------------------------------------------------------------
 # ICP结果过滤配置 (ICP Result Filtering)
 # -----------------------------------------------------------------------------
-# 防止ICP错误收敛(false convergence)导致的定位跳变
-# 当连续两帧ICP的offset变化超过阈值时，拒绝该帧结果
-# 注意：首次ICP结果和relocalize服务调用后的结果不受此限制
-max_offset_jump_t: 0.3            # 允许的最大单帧offset位移变化(m)
-                                   # 建议0.2-0.5，根据机器人速度和ICP频率调整
-                                   # 以1Hz ICP + 1m/s机器人为例，纯LIO漂移约0.05m/s
-                                   # 0.3m足以容纳正常漂移但拒绝错误收敛
-max_offset_jump_yaw: 5.0          # 允许的最大单帧offset yaw变化(deg)
-                                   # 建议3-10度
+# 使用EMA(指数移动平均)平滑ICP offset，防止跳变同时保持响应性
+# 工作原理：new_offset = alpha * ICP结果 + (1-alpha) * 历史值
+# 首次ICP和relocalize后不平滑(alpha=1.0)，直接使用ICP结果
+offset_ema_alpha: 0.3              # EMA平滑因子 (0-1)
+                                   # 0.3 = 新ICP结果占30%权重，历史占70%
+                                   # 值越小越平滑但响应越慢
+                                   # 3Hz × alpha=0.3 → 约1秒完成63%收敛
+                                   # 建议0.2-0.5
+
+# 安全阈值 - 拒绝明显错误的ICP结果（如ICP误收敛到错误位置）
+max_offset_jump_t: 0.8            # 单帧offset最大允许位移变化(m)
+                                   # 超过此值完全拒绝（不进入EMA）
+                                   # 3Hz下正常漂移<0.02m/帧，0.8m为极端异常
+max_offset_jump_yaw: 15.0         # 单帧offset最大允许yaw变化(deg)
+                                   # 超过此值完全拒绝
 
 # =============================================================================
 # 调参建议
@@ -80,9 +89,17 @@ max_offset_jump_yaw: 5.0          # 允许的最大单帧offset yaw变化(deg)
 # 2. 室内环境有变化（家具移动等）:
 #    - 增大rough_score_thresh到0.35
 #    - 增大refine_score_thresh到0.15
-#    - 降低update_hz到0.5以减少错误校正
+#    - 增大offset_ema_alpha到0.5以加快适应
 #
 # 3. 如果定位精度不够:
-#    - 减小refine_scan_resolution到0.05
-#    - 增大refine_max_iteration到15
+#    - 减小refine_scan_resolution到0.03
+#    - 增大refine_max_iteration到25
+#
+# 4. 如果EMA导致响应太慢（转弯时有延迟）:
+#    - 增大offset_ema_alpha到0.5-0.7
+#    - 增大update_hz到5
+#
+# 5. 如果定位仍有毛刺（抖动）:
+#    - 减小offset_ema_alpha到0.15-0.2
+#    - 减小max_offset_jump_t到0.5
 # =============================================================================

@@ -63,8 +63,10 @@ localization_mode: true            # 定位模式安全网（推荐在定位场�
                                    #       即使 auto_relocalize 未调用 reset_mapping，也能防止地图退化
                                    #       注意：仅冻结地图，不加载先验PCD（需配合 reset_mapping 获得最佳效果）
                                    # false: 不自动冻结，仅依赖 reset_mapping 或 freeze_map 配置
-localization_freeze_delay_frames: 200  # 定位模式延迟冻结帧数，约 20 秒 @10Hz
-                                       # 给 IMU 初始化和 ICP 重定位留出足够时间
+localization_freeze_delay_frames: 1000  # 定位模式延迟冻结帧数，约 100 秒 @10Hz
+                                        # 足够时间积累丰富的ikd-Tree点云（~5-6万点）
+                                        # 点云越丰富，后续ICP匹配质量越好
+                                        # (旧值200帧仅~1.3万点，导致ICP长时间运行后匹配退化)
 
 # -----------------------------------------------------------------------------
 # IMU噪声参数 (IMU Noise Parameters) - 卡尔曼滤波协方差

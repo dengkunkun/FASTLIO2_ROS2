@@ -37,8 +37,9 @@ struct NodeConfig
     double update_hz = 1.0;
     
     // ICP 结果过滤 - 防止 ICP 错误收敛导致的大跳变
-    double max_offset_jump_t = 0.3;      // 允许的最大单帧 offset 位移变化 (m)
-    double max_offset_jump_yaw = 5.0;    // 允许的最大单帧 offset yaw 变化 (deg)
+    double max_offset_jump_t = 0.8;      // 安全阈值: 超过此变化量完全拒绝 (m)
+    double max_offset_jump_yaw = 15.0;   // 安全阈值: 超过此变化量完全拒绝 (deg)
+    double offset_ema_alpha = 0.3;       // EMA 平滑因子 (0-1), 值越小越平滑
 };
 
 // ============================================================================
@@ -107,6 +108,10 @@ struct NodeState
     bool has_valid_offset = false;              // 是否已有有效的 offset (第一次 ICP 后为 true)
     uint64_t icp_reject_count = 0;              // 因 offset 跳变过大被拒绝的 ICP 结果计数
     uint64_t icp_reject_consecutive = 0;        // 连续被拒绝的计数
+    
+    // 暖机状态 — relocalize 后暂时禁用安全阈值，让 ICP 快速收敛
+    uint64_t warmup_remaining = 0;              // 剩余暖机 ICP 次数
+    static constexpr uint64_t WARMUP_COUNT = 10; // relocalize 后的暖机 ICP 次数
     
     // For async processing
     bool new_data_available = false;
@@ -191,9 +196,12 @@ public:
         if (config["max_offset_jump_yaw"]) {
             m_config.max_offset_jump_yaw = config["max_offset_jump_yaw"].as<double>();
         }
+        if (config["offset_ema_alpha"]) {
+            m_config.offset_ema_alpha = std::clamp(config["offset_ema_alpha"].as<double>(), 0.01, 1.0);
+        }
         RCLCPP_INFO(this->get_logger(), 
-            "[CONFIG] ICP offset filter: max_jump_t=%.3fm, max_jump_yaw=%.1fdeg",
-            m_config.max_offset_jump_t, m_config.max_offset_jump_yaw);
+            "[CONFIG] ICP offset filter: max_jump_t=%.3fm, max_jump_yaw=%.1fdeg, ema_alpha=%.2f",
+            m_config.max_offset_jump_t, m_config.max_offset_jump_yaw, m_config.offset_ema_alpha);
     }
     
     // Lightweight timer callback - only handles TF broadcasting
@@ -302,7 +310,7 @@ public:
         double rough_score = m_localizer->lastRoughFitness();
         double refine_score = m_localizer->lastRefineFitness();
         
-        RCLCPP_INFO(this->get_logger(), 
+        RCLCPP_WARN(this->get_logger(), 
             "[ICP] result=%s cloud=%zu rough_score=%.4f refine_score=%.4f time=%.1fms", 
             result ? "SUCCESS" : "FAILED", cloud_size, rough_score, refine_score, icp_duration_ms);
         
@@ -374,63 +382,115 @@ public:
                     refine_score, icp_correction, gap_since_last);
             }
             
-            // ===== ICP 结果过滤: 拒绝 offset 跳变过大的结果 =====
-            // 跳过检查的条件:
-            //   1. 首次获得有效 offset (has_valid_offset == false)
-            //   2. 刚通过 relocalize 服务设置了初始位姿
-            // 否则, 如果 offset 变化超过阈值, 拒绝此次 ICP 结果
-            bool skip_rejection_check = !m_state.has_valid_offset || m_state.service_received;
+            // ===== ICP 结果过滤: EMA平滑 + 安全阈值 =====
+            // 策略:
+            //   1. 首次 ICP / relocalize 后: 直接使用 (alpha = 1.0)
+            //   2. offset 变化 > 安全阈值: 完全拒绝 (ICP 严重误收敛)
+            //   3. 正常范围内: 通过 EMA 平滑, 消除抖动同时保持响应性
+            bool in_warmup = (m_state.warmup_remaining > 0);
+            bool skip_filter = !m_state.has_valid_offset || m_state.service_received || in_warmup;
             bool offset_rejected = false;
             
-            if (!skip_rejection_check && 
+            if (!skip_filter && 
                 (delta_offset_t_norm > m_config.max_offset_jump_t || 
                  delta_offset_yaw_deg > m_config.max_offset_jump_yaw))
             {
+                // 安全拒绝: 变化量异常大, 完全不接受
                 offset_rejected = true;
                 m_state.icp_reject_count++;
                 m_state.icp_reject_consecutive++;
                 
                 RCLCPP_WARN(this->get_logger(), 
-                    "[ICP_REJECT] Offset jump too large! dt_2d=%.4fm (max=%.3f) dyaw=%.3fdeg (max=%.1f) "
+                    "[ICP_REJECT] Offset jump exceeds safety threshold! dt_2d=%.4fm (max=%.3f) dyaw=%.3fdeg (max=%.1f) "
                     "refine=%.4f | REJECTED (total=%lu consecutive=%lu)",
                     delta_offset_t_norm, m_config.max_offset_jump_t,
                     delta_offset_yaw_deg, m_config.max_offset_jump_yaw,
                     refine_score,
                     m_state.icp_reject_count, m_state.icp_reject_consecutive);
                 
-                // 如果连续拒绝过多次 (>10), 说明可能是真正的位置变化 (如手动搬运机器人)
-                // 此时接受 ICP 结果, 重置连续计数
-                if (m_state.icp_reject_consecutive > 10) {
+                // 连续拒绝过多次 (>15): 可能是真正的位置变化 (如手动搬运机器人)
+                // 此时接受, 但仍然通过 EMA 平滑
+                if (m_state.icp_reject_consecutive > 15) {
                     offset_rejected = false;
+                    skip_filter = true;  // 直接使用, 相当于 alpha=1.0
                     RCLCPP_WARN(this->get_logger(), 
-                        "[ICP_REJECT] Too many consecutive rejections (%lu), accepting result as position may have truly changed",
+                        "[ICP_REJECT] Too many consecutive rejections (%lu), accepting as position may have truly changed",
                         m_state.icp_reject_consecutive);
                     m_state.icp_reject_consecutive = 0;
                 }
             } else {
-                m_state.icp_reject_consecutive = 0;  // 正常结果, 重置连续拒绝计数
+                m_state.icp_reject_consecutive = 0;
             }
             
-            // 标准诊断日志
-            RCLCPP_INFO(this->get_logger(), 
+            // 应用 EMA 平滑
+            M3D final_offset_r;
+            V3D final_offset_t;
+            
+            if (skip_filter) {
+                // 首次 / relocalize / force-accept / warmup: 直接使用 ICP 结果
+                final_offset_r = new_offset_r;
+                final_offset_t = new_offset_t;
+                
+                if (in_warmup) {
+                    m_state.warmup_remaining--;
+                    RCLCPP_WARN(this->get_logger(), 
+                        "[WARMUP] Direct apply (remaining=%lu, refine_score=%.4f, dt_2d=%.4fm)",
+                        m_state.warmup_remaining, refine_score, delta_offset_t_norm);
+                } else {
+                    RCLCPP_WARN(this->get_logger(), "[EMA] Direct apply (alpha=1.0, refine_score=%.4f)", refine_score);
+                }
+                
+                // 初始 ICP 质量检查 — relocalize 后首次 ICP 质量差时警告
+                if (m_state.service_received && refine_score > 0.05) {
+                    RCLCPP_WARN(this->get_logger(),
+                        "[QUALITY_WARN] Initial ICP after relocalize has poor quality! "
+                        "refine_score=%.4f (>0.05) — warmup phase will correct",
+                        refine_score);
+                }
+            } else if (!offset_rejected) {
+                // 正常 EMA 平滑
+                double alpha = m_config.offset_ema_alpha;
+                
+                // Translation EMA
+                final_offset_t = alpha * new_offset_t + (1.0 - alpha) * m_state.last_offset_t;
+                
+                // Rotation EMA via quaternion SLERP
+                Eigen::Quaterniond old_q(m_state.last_offset_r);
+                Eigen::Quaterniond new_q(new_offset_r);
+                old_q.normalize();
+                new_q.normalize();
+                // 确保最短路径插值
+                if (old_q.dot(new_q) < 0.0) {
+                    new_q.coeffs() *= -1.0;
+                }
+                Eigen::Quaterniond smoothed_q = old_q.slerp(alpha, new_q);
+                final_offset_r = smoothed_q.toRotationMatrix();
+                
+                RCLCPP_WARN(this->get_logger(), "[EMA] Smoothed alpha=%.2f dt_2d=%.4fm refine=%.4f",
+                    alpha, delta_offset_t_norm, refine_score);
+            }
+            
+            // 标准诊断日志 (WARN 级别确保不被 launch 脚本屏蔽)
+            RCLCPP_WARN(this->get_logger(), 
                 "[DRIFT_DEBUG] ICP(map->body): t=(%.3f,%.3f,%.3f) rpy=(%.1f,%.1f,%.1f)deg",
                 map_body_t.x(), map_body_t.y(), map_body_t.z(),
                 map_body_roll * 180.0 / M_PI, map_body_pitch * 180.0 / M_PI, map_body_yaw * 180.0 / M_PI);
-            RCLCPP_INFO(this->get_logger(), 
+            RCLCPP_WARN(this->get_logger(), 
                 "[DRIFT_DEBUG] LIO(local->body): t=(%.3f,%.3f,%.3f) yaw=%.1fdeg",
                 current_local_t.x(), current_local_t.y(), current_local_t.z(),
                 local_body_yaw * 180.0 / M_PI);
-            RCLCPP_INFO(this->get_logger(), 
+            RCLCPP_WARN(this->get_logger(), 
                 "[DRIFT_DEBUG] Offset(map->local): t=(%.3f,%.3f,%.3f) yaw=%.1fdeg | "
-                "delta: dt_2d=%.4fm dyaw=%.3fdeg | correction=%.4fm | %s",
+                "delta: dt_2d=%.4fm dyaw=%.3fdeg | correction=%.4fm | %s%s",
                 new_offset_t.x(), new_offset_t.y(), new_offset_t.z(),
                 offset_yaw * 180.0 / M_PI,
                 delta_offset_t_norm, delta_offset_yaw_deg, icp_correction,
-                offset_rejected ? "REJECTED" : "ACCEPTED");
+                offset_rejected ? "REJECTED" : "ACCEPTED",
+                in_warmup ? " [WARMUP]" : "");
             
             if (!offset_rejected) {
-                m_state.last_offset_r = new_offset_r;
-                m_state.last_offset_t = new_offset_t;
+                m_state.last_offset_r = final_offset_r;
+                m_state.last_offset_t = final_offset_t;
                 m_state.offset_ref_local_r = current_local_r;
                 m_state.offset_ref_local_t = current_local_t;
                 m_state.has_valid_offset = true;
@@ -441,6 +501,11 @@ public:
                 std::lock_guard<std::mutex> slock(m_state.service_mutex);
                 m_state.localize_success = true;
                 m_state.service_received = false;
+                // 进入暖机阶段 — 下一批 ICP 使用 alpha=1.0 并跳过安全阈值
+                m_state.warmup_remaining = NodeState::WARMUP_COUNT;
+                RCLCPP_WARN(this->get_logger(), 
+                    "[WARMUP] Relocalize accepted, entering warmup phase (%lu ICPs with direct apply)",
+                    m_state.warmup_remaining);
             }
         }
         else
@@ -461,6 +526,18 @@ public:
                 "rough_score=%.4f refine_score=%.4f cloud=%zu",
                 m_diag.icp_consecutive_fails, gap,
                 rough_score, refine_score, cloud_size);
+            
+            // 连续 ICP 失败超过阈值且已有有效定位: FAST-LIO 可能已经发散
+            // 停止发布 offset TF, 让 tf_bridge 的跳变抑制冻结机器人位置
+            // 注意: 启动阶段 "Map not loaded" 时 has_valid_offset=false, 不触发
+            if (m_diag.icp_consecutive_fails == 10 && m_state.has_valid_offset) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "[ICP_DIVERGE] %lu consecutive ICP failures (gap=%.1fs)! "
+                    "FAST-LIO may have diverged. Invalidating offset — "
+                    "robot position will be frozen until ICP recovers or relocalize is triggered.",
+                    m_diag.icp_consecutive_fails, gap);
+                m_state.has_valid_offset = false;
+            }
         }
         
         // 每30秒输出综合诊断报告
@@ -477,34 +554,35 @@ public:
                 m_diag.icp_score_sum / m_diag.icp_success_count : 0.0;
             double drift_from_origin = (m_diag.prev_odom_t - m_diag.first_odom_t).head<2>().norm();
             
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "╔══════════════════════════════════════════════════════════════╗");
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "║ [LOCALIZER DIAG] uptime=%.0fs  odom_distance=%.1fm          ║",
                 uptime, m_diag.odom_total_distance);
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "║ ICP: total=%lu success=%lu fail=%lu rate=%.1f%%              ║",
                 m_diag.icp_total_count, m_diag.icp_success_count, 
                 m_diag.icp_fail_count, success_rate);
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "║ ICP score: avg=%.4f min=%.4f max=%.4f last=%.4f     ║",
                 avg_score, 
                 m_diag.icp_score_min < 1e9 ? m_diag.icp_score_min : 0.0,
                 m_diag.icp_score_max, m_diag.icp_last_refine_score);
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "║ Offset drift: cumulative=%.4fm max_single=%.4fm             ║",
                 m_diag.cumulative_offset_drift, m_diag.max_delta_offset_t);
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "║ Offset yaw: max_single=%.3fdeg                              ║",
                 m_diag.max_delta_offset_yaw);
-            RCLCPP_INFO(this->get_logger(),
-                "║ Fails: max_consecutive=%lu max_gap=%.1fs                    ║",
-                m_diag.icp_max_consecutive_fails, m_diag.max_icp_gap_seconds);
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
+                "║ Fails: max_consecutive=%lu max_gap=%.1fs reject=%lu         ║",
+                m_diag.icp_max_consecutive_fails, m_diag.max_icp_gap_seconds,
+                m_state.icp_reject_count);
+            RCLCPP_WARN(this->get_logger(),
                 "║ Cloud: min=%zu max=%zu  LIO_dist_from_origin=%.2fm          ║",
                 m_diag.min_cloud_size < SIZE_MAX ? m_diag.min_cloud_size : (size_t)0,
                 m_diag.max_cloud_size, drift_from_origin);
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "╚══════════════════════════════════════════════════════════════╝");
         }
         
