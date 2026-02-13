@@ -21,6 +21,8 @@
 #include "localizers/icp_localizer.h"
 #include "interface/srv/relocalize.hpp"
 #include "interface/srv/is_valid.hpp"
+#include "interface/srv/reset_state.hpp"
+#include "interface/msg/localization_status.hpp"
 #include <yaml-cpp/yaml.h>
 
 // For component registration
@@ -142,6 +144,16 @@ public:
         m_reloc_check_srv = this->create_service<interface::srv::IsValid>("relocalize_check", std::bind(&LocalizerNode::relocCheckCB, this, std::placeholders::_1, std::placeholders::_2));
 
         m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", 10);
+
+        // Health status publisher (1Hz, latched for late subscribers)
+        rclcpp::QoS status_qos(1);
+        status_qos.transient_local();
+        m_status_pub = this->create_publisher<interface::msg::LocalizationStatus>(
+            "localization_status", status_qos);
+
+        // LIO reset_state client (for resetting IESKF after relocalize)
+        m_lio_reset_client = this->create_client<interface::srv::ResetState>(
+            "/fastlio2/lio_node/reset_state");
 
         // Timer for TF broadcasting (lightweight, stays in callback thread)
         m_tf_timer = this->create_wall_timer(10ms, std::bind(&LocalizerNode::tfTimerCB, this));
@@ -506,6 +518,9 @@ public:
                 RCLCPP_WARN(this->get_logger(), 
                     "[WARMUP] Relocalize accepted, entering warmup phase (%lu ICPs with direct apply)",
                     m_state.warmup_remaining);
+                // 通知 FAST-LIO 重置 IESKF 状态到 ICP 确认的位姿
+                requestLioReset(map_body_t.x(), map_body_t.y(), map_body_t.z(),
+                                map_body_yaw, map_body_pitch, map_body_roll);
             }
         }
         else
@@ -587,6 +602,7 @@ public:
         }
         
         publishMapCloud(current_time);
+        publishLocalizationStatus();
     }
 
     void syncCB(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud_msg, const nav_msgs::msg::Odometry::ConstSharedPtr &odom_msg)
@@ -774,6 +790,64 @@ public:
         m_map_cloud_pub->publish(map_cloud_msg);
     }
 
+    // ================================================================
+    // 定位健康状态发布 (每次 ICP 后调用)
+    // ================================================================
+    void publishLocalizationStatus()
+    {
+        interface::msg::LocalizationStatus msg;
+        msg.stamp = this->now();
+
+        // 判定状态等级
+        if (!m_state.has_valid_offset) {
+            msg.status = interface::msg::LocalizationStatus::STATUS_UNINITIALIZED;
+        } else if (m_diag.icp_consecutive_fails >= 10) {
+            msg.status = interface::msg::LocalizationStatus::STATUS_LOST;
+        } else if (m_diag.icp_consecutive_fails >= 3) {
+            msg.status = interface::msg::LocalizationStatus::STATUS_DEGRADED;
+        } else {
+            msg.status = interface::msg::LocalizationStatus::STATUS_OK;
+        }
+
+        msg.icp_consecutive_fails = static_cast<uint32_t>(m_diag.icp_consecutive_fails);
+
+        auto now_steady = std::chrono::steady_clock::now();
+        msg.seconds_since_last_icp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now_steady - m_diag.last_icp_success_time).count() / 1000.0;
+        msg.last_icp_fitness = m_diag.icp_last_refine_score;
+        msg.has_valid_offset = m_state.has_valid_offset;
+
+        m_status_pub->publish(msg);
+    }
+
+    // ================================================================
+    // 请求 LIO IESKF 状态重置 (relocalize 成功后调用)
+    // ================================================================
+    void requestLioReset(double x, double y, double z, double yaw, double pitch, double roll)
+    {
+        if (!m_lio_reset_client->service_is_ready()) {
+            RCLCPP_WARN(this->get_logger(),
+                "[LIO_RESET] Service not available, skipping IESKF reset");
+            return;
+        }
+        auto req = std::make_shared<interface::srv::ResetState::Request>();
+        req->x = x;
+        req->y = y;
+        req->z = z;
+        req->yaw = yaw;
+        req->pitch = pitch;
+        req->roll = roll;
+        auto future = m_lio_reset_client->async_send_request(req,
+            [this](rclcpp::Client<interface::srv::ResetState>::SharedFuture result) {
+                auto resp = result.get();
+                if (resp->success) {
+                    RCLCPP_INFO(this->get_logger(), "[LIO_RESET] IESKF state reset OK: %s", resp->message.c_str());
+                } else {
+                    RCLCPP_ERROR(this->get_logger(), "[LIO_RESET] Failed: %s", resp->message.c_str());
+                }
+            });
+    }
+
 private:
     NodeConfig m_config;
     NodeState m_state;
@@ -788,6 +862,8 @@ private:
     rclcpp::Service<interface::srv::Relocalize>::SharedPtr m_reloc_srv;
     rclcpp::Service<interface::srv::IsValid>::SharedPtr m_reloc_check_srv;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_map_cloud_pub;
+    rclcpp::Publisher<interface::msg::LocalizationStatus>::SharedPtr m_status_pub;
+    rclcpp::Client<interface::srv::ResetState>::SharedPtr m_lio_reset_client;
     
     // Thread management for async ICP processing
     std::thread m_process_thread;

@@ -24,6 +24,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <yaml-cpp/yaml.h>
+#include "interface/srv/reset_state.hpp"
 
 // For component registration
 #include <rclcpp_components/register_node_macro.hpp>
@@ -82,6 +83,12 @@ public:
                 "[LOCALIZATION_MODE] Enabled - ikd-Tree will auto-freeze after %d frames if not already frozen",
                 m_builder_config.localization_freeze_delay_frames);
         }
+
+        // Create reset_state service for localization recovery
+        m_reset_state_srv = this->create_service<interface::srv::ResetState>(
+            "reset_state",
+            std::bind(&LIONode::resetStateCB, this,
+                      std::placeholders::_1, std::placeholders::_2));
 
         // Start processing thread for heavy computation (avoiding callback blocking)
         m_process_thread = std::thread(&LIONode::processLoop, this);
@@ -426,6 +433,63 @@ public:
         }
     }
 
+    /**
+     * @brief 重置 IESKF 状态到指定位姿
+     * 用于 localizer relocalize 成功后，将 LIO 的 IESKF 状态和 ikd-tree
+     * 重新初始化到正确位置，而无需重启整个节点。
+     */
+    void resetStateCB(
+        const std::shared_ptr<interface::srv::ResetState::Request> request,
+        std::shared_ptr<interface::srv::ResetState::Response> response)
+    {
+        std::lock_guard<std::mutex> lock(m_builder_mutex);
+
+        // 1. 设置 IESKF 状态到指定位姿
+        Eigen::AngleAxisd yaw_aa(request->yaw, V3D::UnitZ());
+        Eigen::AngleAxisd pitch_aa(request->pitch, V3D::UnitY());
+        Eigen::AngleAxisd roll_aa(request->roll, V3D::UnitX());
+        M3D new_rot = (yaw_aa * pitch_aa * roll_aa).toRotationMatrix();
+        V3D new_pos(request->x, request->y, request->z);
+
+        auto &state = m_kf->x();
+        state.r_wi = new_rot;
+        state.t_wi = new_pos;
+        state.v = V3D::Zero();  // 重置速度
+        // 保留 bg/ba/g/r_il/t_il — 这些是标定量，不应重置
+
+        // 2. 重置协方差到较大值 (让 IESKF 快速收敛到新位姿)
+        m_kf->P().setIdentity();
+        m_kf->P().block<3, 3>(0, 0) *= 0.01;  // rot: 0.01 rad^2
+        m_kf->P().block<3, 3>(3, 3) *= 0.1;   // pos: 0.1 m^2
+        m_kf->P().block<3, 3>(12, 12) *= 0.1;  // vel: 0.1 (m/s)^2
+        // bg/ba covariance 保持小值 (已标定)
+        m_kf->P().block<3, 3>(15, 15) *= 1e-6;
+        m_kf->P().block<3, 3>(18, 18) *= 1e-4;
+        // r_il/t_il covariance 保持小值 (已标定)
+        m_kf->P().block<3, 3>(6, 6) *= 1e-6;
+        m_kf->P().block<3, 3>(9, 9) *= 1e-6;
+
+        // 3. 清除 IMU/LiDAR 缓存中的陈旧数据
+        {
+            std::lock_guard<std::mutex> imu_lock(m_state_data.imu_mutex);
+            std::lock_guard<std::mutex> lidar_lock(m_state_data.lidar_mutex);
+            m_state_data.imu_buffer.clear();
+            m_state_data.lidar_buffer.clear();
+            m_state_data.lidar_pushed = false;
+        }
+
+        RCLCPP_WARN(this->get_logger(),
+            "[RESET_STATE] IESKF reset to pose: t=(%.3f,%.3f,%.3f) "
+            "rpy=(%.1f,%.1f,%.1f)deg. Velocity zeroed, buffers cleared.",
+            request->x, request->y, request->z,
+            request->roll * 180.0 / M_PI,
+            request->pitch * 180.0 / M_PI,
+            request->yaw * 180.0 / M_PI);
+
+        response->success = true;
+        response->message = "IESKF state reset successfully";
+    }
+
     // Keep timerCB for backward compatibility (not used with thread model)
     void timerCB()
     {
@@ -450,6 +514,7 @@ private:
     std::shared_ptr<MapBuilder> m_builder;
     std::mutex m_builder_mutex;
     std::shared_ptr<tf2_ros::TransformBroadcaster> m_tf_broadcaster;
+    rclcpp::Service<interface::srv::ResetState>::SharedPtr m_reset_state_srv;
     
     // Thread management for async processing
     std::thread m_process_thread;

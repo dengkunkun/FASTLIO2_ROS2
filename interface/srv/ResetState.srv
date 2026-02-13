@@ -1,0 +1,11 @@
+# 重置 FAST-LIO IESKF 状态到指定位姿
+# 用于定位发散后的状态恢复 (由 localizer 在 relocalize 成功后调用)
+float64 x
+float64 y
+float64 z
+float64 yaw
+float64 pitch
+float64 roll
+---
+bool success
+string message
