@@ -2,7 +2,6 @@
 
 #include <pcl/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
-#include <tf2_eigen/tf2_eigen.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include <filesystem>
@@ -12,9 +11,6 @@ MapUpdaterNode::MapUpdaterNode(const rclcpp::NodeOptions& options)
     : Node("map_updater_node", options)
 {
     loadConfig();
-
-    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     CoreConfig core_cfg;
     core_cfg.map_resolution = config_.map_resolution;
@@ -30,6 +26,10 @@ MapUpdaterNode::MapUpdaterNode(const rclcpp::NodeOptions& options)
     scan_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         config_.scan_topic, rclcpp::QoS(5),
         std::bind(&MapUpdaterNode::onLidarScan, this, std::placeholders::_1));
+
+    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        config_.odom_topic, rclcpp::QoS(5),
+        std::bind(&MapUpdaterNode::onOdometry, this, std::placeholders::_1));
 
     save_srv_ = create_service<interface::srv::SaveMaps>(
         "save_map",
@@ -48,9 +48,10 @@ MapUpdaterNode::MapUpdaterNode(const rclcpp::NodeOptions& options)
     process_thread_ = std::thread(&MapUpdaterNode::processLoop, this);
 
     RCLCPP_INFO(get_logger(),
-                "MapUpdaterNode started. scan_topic=%s map_frame=%s "
+                "MapUpdaterNode started. scan_topic=%s odom_topic=%s map_frame=%s "
                 "map_resolution=%.2f removal_resolution=%.3f publish_rate=%.1fHz",
-                config_.scan_topic.c_str(), config_.map_frame.c_str(),
+                config_.scan_topic.c_str(), config_.odom_topic.c_str(),
+                config_.map_frame.c_str(),
                 config_.map_resolution, config_.removal_resolution,
                 config_.publish_rate_hz);
 }
@@ -92,10 +93,11 @@ void MapUpdaterNode::loadConfig()
     };
 
     config_.initial_pcd_path = get("initial_pcd_path", std::string(""));
-    config_.map_frame = get("map_frame", std::string("map_camera_init"));
+    config_.map_frame = get("map_frame", std::string("camera_init"));
     config_.scan_topic =
-        get("scan_topic", std::string("/livox/lidar_base_link_filtered"));
-    config_.tf_timeout_s = get("tf_timeout_s", 0.2);
+        get("scan_topic", std::string("/fastlio2/world_cloud"));
+    config_.odom_topic =
+        get("odom_topic", std::string("/fastlio2/lio_odom"));
     config_.scan_process_interval_s = get("scan_process_interval_s", 0.5);
     config_.map_resolution = get("map_resolution", 0.2);
     config_.scan_resolution = get("scan_resolution", 0.15);
@@ -137,6 +139,21 @@ void MapUpdaterNode::loadInitialMap()
     }
 }
 
+void MapUpdaterNode::onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lock(odom_mutex_);
+    latest_sensor_origin_ = Eigen::Vector3f(
+        static_cast<float>(msg->pose.pose.position.x),
+        static_cast<float>(msg->pose.pose.position.y),
+        static_cast<float>(msg->pose.pose.position.z));
+    latest_sensor_orientation_ = Eigen::Quaternionf(
+        static_cast<float>(msg->pose.pose.orientation.w),
+        static_cast<float>(msg->pose.pose.orientation.x),
+        static_cast<float>(msg->pose.pose.orientation.y),
+        static_cast<float>(msg->pose.pose.orientation.z));
+    has_odom_ = true;
+}
+
 void MapUpdaterNode::onLidarScan(
     const sensor_msgs::msg::PointCloud2::SharedPtr msg)
 {
@@ -150,75 +167,57 @@ void MapUpdaterNode::onLidarScan(
         return;
     }
 
-    RCLCPP_DEBUG(get_logger(),
-                 "Scan received: frame=%s points=%u×%u",
-                 msg->header.frame_id.c_str(), msg->width, msg->height);
-
-    geometry_msgs::msg::TransformStamped tf_stamped;
-    try
+    // Get sensor origin and orientation from cached odometry.
+    // lio_odom publishes t_wi (IMU position in world frame).
+    // For mid-360 the IMU-LiDAR offset is ~5cm, negligible for ray-casting.
+    Eigen::Vector3f sensor_origin;
+    Eigen::Quaternionf sensor_orientation;
     {
-        tf_stamped = tf_buffer_->lookupTransform(
-            config_.map_frame, msg->header.frame_id,
-            tf2::TimePointZero,
-            tf2::durationFromSec(config_.tf_timeout_s));
-    }
-    catch (const tf2::TransformException& ex)
-    {
-        scans_dropped_tf_++;
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                             "TF lookup failed (%s->%s): %s",
-                             config_.map_frame.c_str(),
-                             msg->header.frame_id.c_str(), ex.what());
-        return;
+        std::lock_guard<std::mutex> lock(odom_mutex_);
+        if (!has_odom_)
+        {
+            scans_dropped_no_odom_++;
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "No odometry received yet, dropping scan");
+            return;
+        }
+        sensor_origin = latest_sensor_origin_;
+        sensor_orientation = latest_sensor_orientation_;
     }
 
-    // Receive as PointXYZ to avoid "Failed to find match for field 'intensity'"
-    // when source topic has no intensity field (e.g. mid360_filter output)
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_xyz(
-        new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::fromROSMsg(*msg, *cloud_xyz);
-    if (cloud_xyz->empty())
+    // world_cloud is PointXYZINormal in camera_init frame.
+    // Parse directly as PointXYZI — pcl::fromROSMsg maps fields by name,
+    // extra fields (normal_x/y/z, curvature) are ignored.
+    CloudType::Ptr cloud_raw(new CloudType);
+    pcl::fromROSMsg(*msg, *cloud_raw);
+    if (cloud_raw->empty())
     {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                              "Received empty scan");
         return;
     }
 
-    // Convert PointXYZ → PointXYZI for internal use
-    CloudType::Ptr cloud_raw(new CloudType);
-    cloud_raw->points.resize(cloud_xyz->size());
-    for (size_t i = 0; i < cloud_xyz->size(); ++i)
-    {
-        cloud_raw->points[i].x = cloud_xyz->points[i].x;
-        cloud_raw->points[i].y = cloud_xyz->points[i].y;
-        cloud_raw->points[i].z = cloud_xyz->points[i].z;
-        cloud_raw->points[i].intensity = 0.0f;
-    }
-    cloud_raw->width = static_cast<uint32_t>(cloud_raw->points.size());
-    cloud_raw->height = 1;
-    cloud_raw->is_dense = cloud_xyz->is_dense;
-
+    // Optional pre-filter (VoxelGrid downsampling).
+    // world_cloud is already filtered by livox2PCL's filter_num,
+    // but not by scan_resolution VoxelGrid.
     CloudType::Ptr cloud_filtered = core_->preFilterScan(cloud_raw);
 
-    Eigen::Isometry3d tf_eigen = tf2::transformToEigen(tf_stamped);
-    Eigen::Affine3f transform = tf_eigen.cast<float>();
-
+    // Points are already in world frame (camera_init) — no TF transform needed.
     PointVec map_points;
     map_points.reserve(cloud_filtered->size());
     for (const auto& pt : cloud_filtered->points)
     {
-        Eigen::Vector3f p(pt.x, pt.y, pt.z);
-        Eigen::Vector3f pm = transform * p;
         PointType mp;
-        mp.x = pm.x();
-        mp.y = pm.y();
-        mp.z = pm.z();
+        mp.x = pt.x;
+        mp.y = pt.y;
+        mp.z = pt.z;
         mp.intensity = pt.intensity;
         map_points.push_back(mp);
     }
 
-    Eigen::Vector3f sensor_origin = transform.translation();
-    Eigen::Vector3f sensor_forward = transform.linear() * Eigen::Vector3f::UnitX();
+    // Compute sensor forward direction from odometry orientation.
+    Eigen::Vector3f sensor_forward =
+        sensor_orientation * Eigen::Vector3f::UnitX();
     if (sensor_forward.squaredNorm() < 1e-6f)
     {
         sensor_forward = Eigen::Vector3f::UnitX();
@@ -231,7 +230,7 @@ void MapUpdaterNode::onLidarScan(
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
                          "Scan processed: raw=%zu filtered=%zu "
                          "sensor_origin=(%.2f,%.2f,%.2f)",
-                         cloud_xyz->size(), map_points.size(),
+                         cloud_raw->size(), map_points.size(),
                          sensor_origin.x(), sensor_origin.y(),
                          sensor_origin.z());
 
@@ -421,11 +420,11 @@ void MapUpdaterNode::logDiagnostics()
 {
     RCLCPP_INFO(get_logger(),
                 "Diag: valid=%d tree=%d voxels=%zu max_miss=%u "
-                "scans(recv=%lu proc=%lu drop_tf=%lu) "
+                "scans(recv=%lu proc=%lu drop_no_odom=%lu) "
                 "pts_added=%lu pts_removed=%lu",
                 core_->validNum(), core_->treeSize(), core_->voxelMapSize(),
                 core_->maxMissCount(),
-                scans_received_, scans_processed_, scans_dropped_tf_,
+                scans_received_, scans_processed_, scans_dropped_no_odom_,
                 points_added_total_, points_removed_total_);
 
     auto hist = core_->getMissHistogram();

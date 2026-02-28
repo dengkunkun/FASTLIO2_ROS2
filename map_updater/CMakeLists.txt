@@ -16,8 +16,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(tf2_eigen REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(interface REQUIRED)
 
@@ -44,8 +43,7 @@ ament_target_dependencies(map_updater_component
   rclcpp
   rclcpp_components
   sensor_msgs
-  tf2_ros
-  tf2_eigen
+  nav_msgs
   pcl_conversions
   interface
 )

@@ -9,20 +9,20 @@
 #include <thread>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
+#include <nav_msgs/msg/odometry.hpp>
 
 #include "interface/srv/save_maps.hpp"
 
 struct MapUpdaterConfig
 {
     std::string initial_pcd_path;
-    std::string map_frame = "map_camera_init";
+    std::string map_frame = "camera_init";
 
-    std::string scan_topic = "/livox/lidar_base_link_filtered";
-    double tf_timeout_s = 0.2;
+    std::string scan_topic = "/fastlio2/world_cloud";
+    std::string odom_topic = "/fastlio2/lio_odom";
     double scan_process_interval_s = 0.5;
 
     double map_resolution = 0.2;
@@ -50,6 +50,7 @@ private:
     void loadInitialMap();
 
     void onLidarScan(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
+    void onOdometry(const nav_msgs::msg::Odometry::SharedPtr msg);
 
     void processLoop();
     void doIncrementalAdd(PointVec& points);
@@ -72,13 +73,16 @@ private:
 
     // ROS interfaces
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr scan_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
     rclcpp::Service<interface::srv::SaveMaps>::SharedPtr save_srv_;
     rclcpp::Service<interface::srv::SaveMaps>::SharedPtr reload_srv_;
 
-    // TF
-    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    // Odometry cache (protected by odom_mutex_)
+    std::mutex odom_mutex_;
+    Eigen::Vector3f latest_sensor_origin_{Eigen::Vector3f::Zero()};
+    Eigen::Quaternionf latest_sensor_orientation_{Eigen::Quaternionf::Identity()};
+    bool has_odom_ = false;
 
     // Threading
     std::thread process_thread_;
@@ -113,7 +117,7 @@ private:
     // Diagnostics
     uint64_t scans_received_ = 0;
     uint64_t scans_processed_ = 0;
-    uint64_t scans_dropped_tf_ = 0;
+    uint64_t scans_dropped_no_odom_ = 0;
     uint64_t points_added_total_ = 0;
     uint64_t points_removed_total_ = 0;
 };
