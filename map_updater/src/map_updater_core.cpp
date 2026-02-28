@@ -1,5 +1,6 @@
 #include "map_updater_core.hpp"
 
+#include <algorithm>
 #include <pcl/point_types.h>
 #include <iostream>
 
@@ -16,7 +17,7 @@ MapUpdaterCore::MapUpdaterCore(const CoreConfig& config)
     }
 
     voxel_map_ = std::make_unique<VoxelHashMap>(
-        static_cast<float>(config_.map_resolution));
+        static_cast<float>(config_.removal_resolution));
 }
 
 bool MapUpdaterCore::loadPCD(const std::string& path)
@@ -150,6 +151,23 @@ int MapUpdaterCore::rayCastAndRemove(
     int removed = 0;
     if (!expired.empty())
     {
+        // VoxelHashMap can be finer than ikd-tree downsample voxel.
+        // Expand deletion boxes to better cover retained ikd-tree points.
+        float pad = std::max(
+            0.0f,
+            static_cast<float>(0.5 * (config_.map_resolution - config_.removal_resolution)));
+        if (pad > 0.0f)
+        {
+            for (auto& box : expired)
+            {
+                box.vertex_min[0] -= pad;
+                box.vertex_min[1] -= pad;
+                box.vertex_min[2] -= pad;
+                box.vertex_max[0] += pad;
+                box.vertex_max[1] += pad;
+                box.vertex_max[2] += pad;
+            }
+        }
         removed = ikdtree_->Delete_Point_Boxes(expired);
     }
     return removed;
@@ -213,4 +231,13 @@ VoxelStats MapUpdaterCore::getVoxelStats() const
 MissHistogram MapUpdaterCore::getMissHistogram() const
 {
     return voxel_map_ ? voxel_map_->getMissHistogram() : MissHistogram{};
+}
+
+void MapUpdaterCore::setVoxelFrontalSector(const Eigen::Vector3f& origin,
+                                           const Eigen::Vector3f& forward,
+                                           float radius,
+                                           float fov_deg)
+{
+    if (voxel_map_)
+        voxel_map_->setFrontalSector(origin, forward, radius, fov_deg);
 }

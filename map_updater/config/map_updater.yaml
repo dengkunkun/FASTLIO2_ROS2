@@ -11,21 +11,27 @@ initial_pcd_path: "/home/firebot/firebot_dragon/maps/test_site_1/map_optimized.p
 map_frame: "map_camera_init"                     # 地图坐标系 (与 localizer 一致)
 
 # --- LiDAR Input ---
-scan_topic: "/livox/lidar_base_link_filtered"    # mid360_filter 输出, base_link 坐标系 (PointXYZ)
+scan_topic: "/livox/lidar_pointcloud2"    # mid360_filter 输出, livox_imu_frame 坐标系 (PointXYZ)
 tf_timeout_s: 0.2                                # TF 查询超时 (秒)
 scan_process_interval_s: 0.5                     # 扫描处理最小间隔 (秒)
 
 # --- Resolution ---
 map_resolution: 0.2                              # ikd-tree 体素降采样大小 (m)
 scan_resolution: 0.15                            # 输入扫描预过滤分辨率 (m)
+# 点云清除用的独立体素分辨率，需细于 map_resolution。
+# 0.2m时人的痕迹与后方墙面会映射到同一voxel key，导致每帧被reset永远无法清除。
+# 0.05m可将两者分隔，确保miss_count能正常积累到阈值。
+removal_voxel_resolution: 0.05                  # VoxelHashMap 分辨率 (m)，独立于 ikd-tree
 
 # --- Publishing ---
 publish_rate_hz: 1.0                             # 地图发布频率 (Hz)
 
 # --- Point Removal (Phase 2) ---
 enable_point_removal: true                      # 是否启用过时点删除
-miss_count_threshold: 10                         # 穿越次数超过此值则删除体素
+miss_count_threshold: 3                          # 穿越次数超过此值则删除体素
 ray_cast_skip: 1                                 # 每 N 个点做一次射线追踪 (降低开销)
 
 # --- Diagnostics ---
 diag_interval_s: 10.0                            # 诊断日志间隔 (秒)
+diag_sector_radius_m: 6.0                        # 定向诊断扇区半径 (m)
+diag_sector_fov_deg: 90.0                        # 定向诊断扇区视场角 (deg)

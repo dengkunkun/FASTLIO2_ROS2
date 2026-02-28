@@ -19,6 +19,7 @@ MapUpdaterNode::MapUpdaterNode(const rclcpp::NodeOptions& options)
     CoreConfig core_cfg;
     core_cfg.map_resolution = config_.map_resolution;
     core_cfg.scan_resolution = config_.scan_resolution;
+    core_cfg.removal_resolution = config_.removal_resolution;
     core_ = std::make_unique<MapUpdaterCore>(core_cfg);
 
     loadInitialMap();
@@ -48,9 +49,10 @@ MapUpdaterNode::MapUpdaterNode(const rclcpp::NodeOptions& options)
 
     RCLCPP_INFO(get_logger(),
                 "MapUpdaterNode started. scan_topic=%s map_frame=%s "
-                "map_resolution=%.2f publish_rate=%.1fHz",
+                "map_resolution=%.2f removal_resolution=%.3f publish_rate=%.1fHz",
                 config_.scan_topic.c_str(), config_.map_frame.c_str(),
-                config_.map_resolution, config_.publish_rate_hz);
+                config_.map_resolution, config_.removal_resolution,
+                config_.publish_rate_hz);
 }
 
 MapUpdaterNode::~MapUpdaterNode()
@@ -97,8 +99,11 @@ void MapUpdaterNode::loadConfig()
     config_.scan_process_interval_s = get("scan_process_interval_s", 0.5);
     config_.map_resolution = get("map_resolution", 0.2);
     config_.scan_resolution = get("scan_resolution", 0.15);
+    config_.removal_resolution = get("removal_voxel_resolution", 0.05);
     config_.publish_rate_hz = get("publish_rate_hz", 1.0);
     config_.diag_interval_s = get("diag_interval_s", 10.0);
+    config_.diag_sector_radius_m = get("diag_sector_radius_m", 6.0);
+    config_.diag_sector_fov_deg = get("diag_sector_fov_deg", 90.0);
     config_.enable_point_removal = get("enable_point_removal", false);
     config_.miss_count_threshold = get("miss_count_threshold", 20);
     config_.ray_cast_skip = get("ray_cast_skip", 10);
@@ -213,6 +218,15 @@ void MapUpdaterNode::onLidarScan(
     }
 
     Eigen::Vector3f sensor_origin = transform.translation();
+    Eigen::Vector3f sensor_forward = transform.linear() * Eigen::Vector3f::UnitX();
+    if (sensor_forward.squaredNorm() < 1e-6f)
+    {
+        sensor_forward = Eigen::Vector3f::UnitX();
+    }
+    else
+    {
+        sensor_forward.normalize();
+    }
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
                          "Scan processed: raw=%zu filtered=%zu "
@@ -225,6 +239,7 @@ void MapUpdaterNode::onLidarScan(
         std::lock_guard<std::mutex> lock(data_mutex_);
         pending_points_ = std::move(map_points);
         pending_sensor_origin_ = sensor_origin;
+        pending_sensor_forward_ = sensor_forward;
         new_scan_available_ = true;
     }
     data_cv_.notify_one();
@@ -237,6 +252,7 @@ void MapUpdaterNode::processLoop()
     {
         PointVec points_to_add;
         Eigen::Vector3f sensor_origin;
+        Eigen::Vector3f sensor_forward;
         ServiceCmd cmd = ServiceCmd::NONE;
         std::string cmd_path;
 
@@ -256,6 +272,7 @@ void MapUpdaterNode::processLoop()
             {
                 points_to_add = std::move(pending_points_);
                 sensor_origin = pending_sensor_origin_;
+                sensor_forward = pending_sensor_forward_;
                 new_scan_available_ = false;
             }
 
@@ -290,7 +307,7 @@ void MapUpdaterNode::processLoop()
             doIncrementalAdd(points_to_add);
             if (config_.enable_point_removal)
             {
-                doPointRemoval(sensor_origin, points_to_add);
+                doPointRemoval(sensor_origin, sensor_forward, points_to_add);
             }
         }
 
@@ -330,8 +347,15 @@ void MapUpdaterNode::doIncrementalAdd(PointVec& points)
 
 void MapUpdaterNode::doPointRemoval(
     const Eigen::Vector3f& origin,
+    const Eigen::Vector3f& forward,
     const PointVec& endpoints)
 {
+    // Set frontal sector for targeted diagnostics.
+    core_->setVoxelFrontalSector(
+        origin, forward,
+        static_cast<float>(config_.diag_sector_radius_m),
+        static_cast<float>(config_.diag_sector_fov_deg));
+
     int before = core_->validNum();
     int removed = core_->rayCastAndRemove(
         origin, endpoints,
@@ -351,12 +375,26 @@ void MapUpdaterNode::doPointRemoval(
                 core_->maxMissCount(), core_->voxelMapSize());
 
     RCLCPP_INFO(get_logger(),
-                "  rayStats: hit(new=%d exist=%d) "
+                "  rayStats: hit(new=%d exist=%d protect=%d) "
                 "rays(cast=%d same_key=%d productive=%d) "
-                "steps(total=%d incremented=%d not_in_map=%d)",
-                stats.hit_new, stats.hit_existing,
+                "steps(total=%d incr=%d from_zero=%d not_in_map=%d)",
+                stats.hit_new, stats.hit_existing, stats.hits_protecting,
                 stats.ray_count, stats.ray_same_key, stats.rays_productive,
-                stats.ray_steps, stats.ray_incremented, stats.ray_not_in_map);
+                stats.ray_steps, stats.ray_incremented, stats.ray_from_zero,
+                stats.ray_not_in_map);
+
+    // Sector stats: front radius/FOV region for obstacle-area cycling analysis.
+    RCLCPP_INFO(get_logger(),
+                "  sector(%.1fm,%.0fdeg): hit(new=%d exist=%d protect=%d) "
+                "ray(incr=%d from_zero=%d) "
+                "protect_ratio=%.0f%%",
+                config_.diag_sector_radius_m, config_.diag_sector_fov_deg,
+                stats.sector_hit_new, stats.sector_hit_existing,
+                stats.sector_hits_protecting,
+                stats.sector_ray_incremented, stats.sector_ray_from_zero,
+                stats.sector_hit_existing > 0
+                    ? 100.0 * stats.sector_hits_protecting / stats.sector_hit_existing
+                    : 0.0);
 }
 
 void MapUpdaterNode::publishUpdatedMap()

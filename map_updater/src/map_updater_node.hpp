@@ -27,9 +27,12 @@ struct MapUpdaterConfig
 
     double map_resolution = 0.2;
     double scan_resolution = 0.15;
+    double removal_resolution = 0.05;   // VoxelHashMap独立分辨率，细于ikd-tree防止voxel重叠
 
     double publish_rate_hz = 1.0;
     double diag_interval_s = 10.0;
+    double diag_sector_radius_m = 6.0;
+    double diag_sector_fov_deg = 90.0;
 
     bool enable_point_removal = false;
     int miss_count_threshold = 20;
@@ -51,6 +54,7 @@ private:
     void processLoop();
     void doIncrementalAdd(PointVec& points);
     void doPointRemoval(const Eigen::Vector3f& origin,
+                        const Eigen::Vector3f& forward,
                         const PointVec& endpoints);
 
     void publishUpdatedMap();
@@ -85,6 +89,7 @@ private:
     // Pending data (protected by data_mutex_)
     PointVec pending_points_;
     Eigen::Vector3f pending_sensor_origin_{Eigen::Vector3f::Zero()};
+    Eigen::Vector3f pending_sensor_forward_{Eigen::Vector3f::UnitX()};
     bool new_scan_available_ = false;
 
     // Service commands (protected by data_mutex_)

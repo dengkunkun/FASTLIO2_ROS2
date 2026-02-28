@@ -38,13 +38,22 @@ struct VoxelData
 struct VoxelStats
 {
     int hit_new = 0;           // observeHit: new voxels created
-    int hit_existing = 0;      // observeHit: existing voxels found (miss_count decremented)
+    int hit_existing = 0;      // observeHit: existing voxels found
+    int hits_protecting = 0;   // observeHit: hit a voxel that had miss_count > 0
     int ray_count = 0;         // observeRay calls executed (excluding same-key skips)
     int ray_same_key = 0;      // observeRay calls skipped (start_key == end_key)
     int ray_steps = 0;         // Total intermediate voxel cells visited across all rays
     int ray_incremented = 0;   // Steps where voxel existed in map and was incremented
+    int ray_from_zero = 0;     // Steps where voxel was incremented from miss_count==0 (fresh tagging)
     int ray_not_in_map = 0;    // Steps where voxel cell had no entry in map
     int rays_productive = 0;   // Rays that incremented at least one voxel
+
+    // Sector-specific counters (front radius/FOV around sensor)
+    int sector_hit_new = 0;          // New voxels created inside sector
+    int sector_hit_existing = 0;     // Endpoint hits on existing voxels inside sector
+    int sector_hits_protecting = 0;  // Cycling resets inside sector
+    int sector_ray_incremented = 0;  // Ray increments inside sector
+    int sector_ray_from_zero = 0;    // Fresh-tag events inside sector
 };
 
 /// Histogram of miss_count distribution across all voxels
@@ -64,8 +73,8 @@ class VoxelHashMap
 public:
     explicit VoxelHashMap(float voxel_size);
 
-    /// Register an endpoint hit; creates voxel if not existing, decrements
-    /// miss_count by 1 for existing voxels (protects active surfaces)
+    /// Register an endpoint hit; creates voxel if not existing, resets
+    /// miss_count to 0 for existing voxels (protects active surfaces)
     void observeHit(float x, float y, float z);
 
     /// Increment miss_count for all traversed voxels between origin and endpoint
@@ -80,6 +89,14 @@ public:
     size_t size() const;
     uint16_t maxMissCount() const;
 
+    /// Set a frontal sector (radius + FOV around origin and forward) for
+    /// targeted stats. Call before each rayCastAndRemove cycle.
+    /// Pass radius<=0 or invalid forward to disable.
+    void setFrontalSector(const Eigen::Vector3f& origin,
+                          const Eigen::Vector3f& forward,
+                          float radius,
+                          float fov_deg);
+
     /// Reset per-batch diagnostic counters (call before each rayCastAndRemove)
     void resetStats();
     /// Get accumulated stats since last resetStats()
@@ -91,8 +108,18 @@ private:
     VoxelKey toKey(float x, float y, float z) const;
     BoxPointType keyToBox(const VoxelKey& key) const;
 
+    /// Returns true if the voxel centre is within the configured frontal sector
+    bool inFrontalSector(float x, float y, float z) const;
+
     float voxel_size_;
     float inv_voxel_size_;
     std::unordered_map<VoxelKey, VoxelData, VoxelKeyHash> voxels_;
     VoxelStats stats_;
+
+    // Frontal sector for targeted stats
+    bool sector_enabled_ = false;
+    Eigen::Vector3f sector_origin_{Eigen::Vector3f::Zero()};
+    Eigen::Vector3f sector_forward_{Eigen::Vector3f::UnitX()};
+    float sector_r2_ = 0.f;     // radius squared
+    float sector_cos_half_fov_ = 0.f;
 };

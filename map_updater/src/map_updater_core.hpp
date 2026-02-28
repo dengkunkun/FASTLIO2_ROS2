@@ -14,6 +14,10 @@ struct CoreConfig
 {
     double map_resolution = 0.2;
     double scan_resolution = 0.15;
+    /// Voxel size used by the removal hash map — independent of ikd-tree.
+    /// Finer than map_resolution to avoid person-trace voxels sharing a key
+    /// with adjacent wall endpoints (resolution overlap cycling).
+    double removal_resolution = 0.05;
 };
 
 class MapUpdaterCore
@@ -47,6 +51,12 @@ public:
     void resetVoxelStats();
     VoxelStats getVoxelStats() const;
     MissHistogram getMissHistogram() const;
+
+    /// Set frontal sector for targeted per-scan stats (radius ≤ 0 disables)
+    void setVoxelFrontalSector(const Eigen::Vector3f& origin,
+                               const Eigen::Vector3f& forward,
+                               float radius,
+                               float fov_deg);
 
 private:
     void buildTree(PointVec& points);

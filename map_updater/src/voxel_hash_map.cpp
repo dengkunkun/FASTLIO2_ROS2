@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 VoxelHashMap::VoxelHashMap(float voxel_size)
     : voxel_size_(voxel_size)
@@ -34,23 +35,32 @@ void VoxelHashMap::observeHit(float x, float y, float z)
 {
     VoxelKey key = toKey(x, y, z);
     auto [it, inserted] = voxels_.emplace(key, VoxelData{0});
+    // Voxel centre for sector check
+    float vx = (key.ix + 0.5f) * voxel_size_;
+    float vy = (key.iy + 0.5f) * voxel_size_;
+    float vz = (key.iz + 0.5f) * voxel_size_;
+    bool in_sector = inFrontalSector(vx, vy, vz);
+
     if (inserted)
     {
         stats_.hit_new++;
+        if (in_sector) stats_.sector_hit_new++;
     }
     else
     {
         stats_.hit_existing++;
-        // Decrement miss_count by 1 to protect active surfaces while still
-        // allowing net accumulation for stale voxels.
-        //   - Legitimate surface: receives ~1-5 hits/scan, ~0-2 ray increments
-        //     → net negative → stays near 0 (protected)
-        //   - Stale voxel overlapping background endpoint: ~1 hit/scan,
-        //     ~1-5 ray increments → net positive → still accumulates
-        //   - Stale voxel with no overlap: 0 hits → pure accumulation
+        if (in_sector) stats_.sector_hit_existing++;
+        // Current scan confirms a surface at this voxel.
+        // Use decay (not hard reset) so stale voxels can still be removed when
+        // miss evidence dominates over time, similar to probabilistic updates.
         if (it->second.miss_count > 0)
         {
-            it->second.miss_count--;
+            stats_.hits_protecting++;  // voxel had accumulated misses and is now decayed
+            if (in_sector) stats_.sector_hits_protecting++;
+        }
+        if (it->second.miss_count > 0)
+        {
+            --it->second.miss_count;
         }
     }
 }
@@ -110,31 +120,46 @@ void VoxelHashMap::observeRay(
     int local_incremented = 0;
     for (int i = 0; i < max_steps; ++i)
     {
-        // Check if we reached the endpoint voxel — process it, then stop.
-        bool at_endpoint =
-            (cx == end_key.ix && cy == end_key.iy && cz == end_key.iz);
+        // Stop at endpoint — it is handled by observeHit (reset to 0).
+        // Only intermediate voxels (free space) get miss_count incremented.
+        if (cx == end_key.ix && cy == end_key.iy && cz == end_key.iz)
+        {
+            break;
+        }
 
-        // Increment miss for voxels that already exist in map
-        // (including the endpoint voxel — observeHit's decrement provides
-        //  the counterbalance for legitimate surfaces)
         VoxelKey cur{cx, cy, cz};
         auto it = voxels_.find(cur);
         if (it != voxels_.end())
         {
-            it->second.miss_count++;
+            bool from_zero = (it->second.miss_count == 0);
+            if (from_zero)
+            {
+                stats_.ray_from_zero++;  // first miss event for this voxel
+            }
+            if (it->second.miss_count < std::numeric_limits<uint16_t>::max())
+            {
+                it->second.miss_count++;
+            }
             stats_.ray_incremented++;
             local_incremented++;
+
+            if (sector_enabled_)
+            {
+                float vx = (cx + 0.5f) * voxel_size_;
+                float vy = (cy + 0.5f) * voxel_size_;
+                float vz = (cz + 0.5f) * voxel_size_;
+                if (inFrontalSector(vx, vy, vz))
+                {
+                    stats_.sector_ray_incremented++;
+                    if (from_zero) stats_.sector_ray_from_zero++;
+                }
+            }
         }
         else
         {
             stats_.ray_not_in_map++;
         }
         stats_.ray_steps++;
-
-        if (at_endpoint)
-        {
-            break;
-        }
 
         // Advance to next voxel boundary
         if (t_max_x < t_max_y)
@@ -188,6 +213,43 @@ std::vector<BoxPointType> VoxelHashMap::collectExpired(uint16_t threshold)
         }
     }
     return expired;
+}
+
+void VoxelHashMap::setFrontalSector(const Eigen::Vector3f& origin,
+                                    const Eigen::Vector3f& forward,
+                                    float radius,
+                                    float fov_deg)
+{
+    if (radius <= 0.f || forward.squaredNorm() < 1e-6f)
+    {
+        sector_enabled_ = false;
+        return;
+    }
+    sector_enabled_ = true;
+    sector_origin_ = origin;
+    sector_forward_ = forward.normalized();
+    sector_r2_ = radius * radius;
+    float half_fov_deg = std::max(0.0f, std::min(179.0f, fov_deg * 0.5f));
+    constexpr float kDegToRad = 0.017453292519943295769f;
+    float half_fov_rad = half_fov_deg * kDegToRad;
+    sector_cos_half_fov_ = std::cos(half_fov_rad);
+}
+
+bool VoxelHashMap::inFrontalSector(float x, float y, float z) const
+{
+    if (!sector_enabled_) return false;
+
+    Eigen::Vector3f delta(x, y, z);
+    delta -= sector_origin_;
+    float d2 = delta.squaredNorm();
+    if (d2 > sector_r2_)
+    {
+        return false;
+    }
+
+    float d = std::sqrt(std::max(d2, 1e-9f));
+    float cos_angle = delta.dot(sector_forward_) / d;
+    return cos_angle >= sector_cos_half_fov_;
 }
 
 void VoxelHashMap::clear()

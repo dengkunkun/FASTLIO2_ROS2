@@ -52,6 +52,8 @@
 | `miss_count_threshold` | `20` | 穿越次数阈值 |
 | `ray_cast_skip` | `10` | 每 N 个点做一次射线追踪 |
 | `diag_interval_s` | `10.0` | 诊断日志间隔 |
+| `diag_sector_radius_m` | `6.0` | 定向诊断扇区半径 |
+| `diag_sector_fov_deg` | `90.0` | 定向诊断扇区视场角 |
 
 ## 话题
 
@@ -112,3 +114,13 @@ colcon build --packages-select map_updater \
 - `PCL` — 点云处理
 - `yaml-cpp` — 配置文件加载
 - `Eigen3` — 线性代数
+
+# 实际测试
+[map_updater.log ](../../../src/Log/map_updater.log) 记录了实际测试过程中的日志输出。测试环境为室内，机器人静止，人工移动障碍物。
+机器人不移动，启动命令：ros2 launch map_updater map_updater.launch.py |tee src/Log/map_updater.log      
+人去移动障碍物，从rviz中可以看到人的移动痕迹和新的障碍物位置
+但是人的移动痕迹和新的障碍物位置在地图上没有被删除，说明增量更新功能正常，但过时点没有删除
+在初始阶段会有部分点被删除，但随后好像不再变化
+障碍物在雷达前方6m半径的90度扇形范围内，可以针对性添加日志分析
+
+已解决：scan_topic使用了过滤后的点云，没有天花板，导致较高的点云没有终点即没有被穿过
