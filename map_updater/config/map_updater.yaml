@@ -1,0 +1,31 @@
+# =============================================================================
+# MapUpdater Node Configuration
+# =============================================================================
+# Maintains incrementally updated global point cloud map for fire detection.
+# Input:  LiDAR scans + TF
+# Output: /map_updater/updated_map (PointCloud2)
+# =============================================================================
+
+# --- Map I/O ---
+initial_pcd_path: "/home/firebot/firebot_dragon/maps/test_site_1/map_optimized.pcd"                             # 初始 PCD 路径 (空 = 空地图)
+map_frame: "map_camera_init"                     # 地图坐标系 (与 localizer 一致)
+
+# --- LiDAR Input ---
+scan_topic: "/livox/lidar_base_link_filtered"    # mid360_filter 输出, base_link 坐标系 (PointXYZ)
+tf_timeout_s: 0.2                                # TF 查询超时 (秒)
+scan_process_interval_s: 0.5                     # 扫描处理最小间隔 (秒)
+
+# --- Resolution ---
+map_resolution: 0.2                              # ikd-tree 体素降采样大小 (m)
+scan_resolution: 0.15                            # 输入扫描预过滤分辨率 (m)
+
+# --- Publishing ---
+publish_rate_hz: 1.0                             # 地图发布频率 (Hz)
+
+# --- Point Removal (Phase 2) ---
+enable_point_removal: true                      # 是否启用过时点删除
+miss_count_threshold: 10                         # 穿越次数超过此值则删除体素
+ray_cast_skip: 1                                 # 每 N 个点做一次射线追踪 (降低开销)
+
+# --- Diagnostics ---
+diag_interval_s: 10.0                            # 诊断日志间隔 (秒)
