@@ -31,10 +31,22 @@
 ### ikd-tree (增量KD树)
 从 FASTLIO2 复制的数据结构，支持增量添加/删除点，内建体素降采样。模板实例化为 `pcl::PointXYZI`。
 
-### VoxelHashMap (过时点检测)
-基于 3D-DDA (Amanatides & Woo) 射线遍历算法的体素哈希表。每个体素记录被射线"穿越"但未命中的次数 (miss_count)，超过阈值则认为该区域物体已被移走，从地图中删除对应点。
+### VoxelHashMap (过时点检测 — Log-odds 概率占据模型)
+基于 3D-DDA (Amanatides & Woo) 射线遍历算法的体素哈希表，采用 OctoMap 风格的 log-odds 概率占据模型。
 
-默认关闭 (`enable_point_removal: false`)，测试稳定后再启用。
+每个 0.05m 体素维护一个 `log_odds` 置信值（正=占据，负=空闲）：
+- **命中 (hit)**: 射线端点所在体素 `+= log_odds_hit (+0.847)`，约为 miss 的 2 倍强度
+- **穿越 (miss)**: 射线路径中间体素 `-= log_odds_miss (-0.405)`，每帧每体素最多 1 次（per-scan 去重）
+- **删除**: `log_odds < free_threshold (-1.0)` 时认为该区域是空闲的，从 ikd-tree 中删除对应点
+
+关键保护机制：
+1. **不对称更新**: hit >> miss，稳定墙面天然抵抗误删
+2. **Per-scan 去重**: 同一体素每帧最多 1 次 miss，防止多射线在一帧内压倒一个体素
+3. **Clamping**: log-odds 限制在 `[clamp_min, clamp_max]`，防止无限累积
+4. **端点保护球**: 射线在端点附近提前停止，避免 VoxelGrid 质心偏移导致误 miss
+
+### addPoints 密度保护
+`addPoints` 在添加扫描点前，逐点检查 ikd-tree 中 `map_resolution/2` 范围内是否已有地图点。仅向**空白区域**添加新点，防止 ikd-tree 的体素降采样 (`Add_Points(..., downsample=true)`) 破坏原始地图密度。
 
 ## 配置参数
 
@@ -42,15 +54,24 @@
 |------|--------|------|
 | `initial_pcd_path` | `""` | 初始 PCD 地图路径，空则从零开始 |
 | `map_frame` | `"map_camera_init"` | 地图坐标系 |
-| `scan_topic` | `"/livox/lidar_base_link_filtered"` | LiDAR 输入 topic |
-| `tf_timeout_s` | `0.2` | TF 查询超时 |
+| `scan_topic` | `"/fastlio2/world_cloud"` | LiDAR 输入 topic (FASTLIO2 世界坐标系点云) |
+| `odom_topic` | `"/fastlio2/lio_odom"` | 里程计 topic (射线追踪起点) |
+| `scan_frame` | `"camera_init"` | scan/odom 坐标系 |
 | `scan_process_interval_s` | `0.5` | 最小处理间隔，控制 CPU 占用 |
-| `map_resolution` | `0.2` | 地图体素大小 (m)，越小越精确但越占内存 |
+| `map_resolution` | `0.2` | ikd-tree 体素大小 (m) |
 | `scan_resolution` | `0.15` | 输入扫描预过滤分辨率 (m) |
+| `removal_voxel_resolution` | `0.05` | VoxelHashMap 体素分辨率 (m) |
 | `publish_rate_hz` | `1.0` | 地图发布频率 |
-| `enable_point_removal` | `false` | 是否启用过时点射线追踪删除 |
-| `miss_count_threshold` | `20` | 穿越次数阈值 |
-| `ray_cast_skip` | `10` | 每 N 个点做一次射线追踪 |
+| `enable_point_removal` | `true` | 是否启用过时点射线追踪删除 |
+| `ray_cast_skip` | `1` | 每 N 个点做一次射线追踪 |
+| `log_odds_hit` | `0.847` | 每次命中的占据证据 (logodds(0.7)) |
+| `log_odds_miss` | `0.405` | 每次穿越的空闲证据 |
+| `log_odds_clamp_max` | `3.5` | 最大占据置信 |
+| `log_odds_clamp_min` | `-2.0` | 最大空闲置信 |
+| `log_odds_free_threshold` | `-1.0` | 删除阈值 |
+| `log_odds_initial` | `2.0` | 新建体素初始置信值 |
+| `endpoint_protection_base_m` | `0.05` | 端点保护球基础半径 (m) |
+| `endpoint_protection_angle_factor` | `0.02` | 每米距离增加的保护半径 |
 | `diag_interval_s` | `10.0` | 诊断日志间隔 |
 | `diag_sector_radius_m` | `6.0` | 定向诊断扇区半径 |
 | `diag_sector_fov_deg` | `90.0` | 定向诊断扇区视场角 |
@@ -117,10 +138,11 @@ colcon build --packages-select map_updater \
 
 # 实际测试
 [map_updater.log ](../../../src/Log/map_updater.log) 记录了实际测试过程中的日志输出。测试环境为室内，机器人静止，人工移动障碍物。
-机器人不移动，启动命令：ros2 launch map_updater map_updater.launch.py |tee src/Log/map_updater.log      
+机器人不移动，启动命令：ros2 launch map_updater map_updater.launch.py |tee src/Log/map_updater.log
 人去移动障碍物，从rviz中可以看到人的移动痕迹和新的障碍物位置
-但是人的移动痕迹和新的障碍物位置在地图上没有被删除，说明增量更新功能正常，但过时点没有删除
-在初始阶段会有部分点被删除，但随后好像不再变化
-障碍物在雷达前方6m半径的90度扇形范围内，可以针对性添加日志分析
 
-已解决：scan_topic使用了过滤后的点云，没有天花板，导致较高的点云没有终点即没有被穿过
+## 已解决的问题
+
+1. **天花板缺失**: scan_topic 使用了过滤后的点云，没有天花板，导致较高的点云没有射线终点即没有被穿过。切换到 world_cloud 解决。
+2. **墙壁稀疏化**: 原始整数 miss_count 模型中，一帧多条射线穿过同一体素导致 count 瞬间超阈值。引入 log-odds 概率模型 + per-scan 去重 + 端点保护球解决射线侧问题。
+3. **ikd-tree 降采样破坏密度**: `Add_Points(..., downsample=true)` 每个 0.2m 体素只保留 1 点，原始稠密地图被大量删减（占总丢失的 98%）。通过 Nearest_Search 过滤已有覆盖区域的扫描点，仅向空白区域添加新点解决。

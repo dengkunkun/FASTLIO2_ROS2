@@ -5,9 +5,10 @@
 #include <cmath>
 #include <limits>
 
-VoxelHashMap::VoxelHashMap(float voxel_size)
+VoxelHashMap::VoxelHashMap(float voxel_size, const LogOddsConfig& config)
     : voxel_size_(voxel_size)
     , inv_voxel_size_(1.0f / voxel_size)
+    , lo_config_(config)
 {
 }
 
@@ -34,7 +35,10 @@ BoxPointType VoxelHashMap::keyToBox(const VoxelKey& key) const
 void VoxelHashMap::observeHit(float x, float y, float z)
 {
     VoxelKey key = toKey(x, y, z);
-    auto [it, inserted] = voxels_.emplace(key, VoxelData{0});
+    // New voxels start at initial_log_odds (a moderate occupied belief).
+    auto [it, inserted] = voxels_.emplace(
+        key, VoxelData{lo_config_.initial_log_odds, 0});
+
     // Voxel centre for sector check
     float vx = (key.ix + 0.5f) * voxel_size_;
     float vy = (key.iy + 0.5f) * voxel_size_;
@@ -50,24 +54,25 @@ void VoxelHashMap::observeHit(float x, float y, float z)
     {
         stats_.hit_existing++;
         if (in_sector) stats_.sector_hit_existing++;
-        // Current scan confirms a surface at this voxel.
-        // Use decay (not hard reset) so stale voxels can still be removed when
-        // miss evidence dominates over time, similar to probabilistic updates.
-        if (it->second.miss_count > 0)
+
+        // Track voxels being recovered from negative log_odds (trending free)
+        if (it->second.log_odds < 0.0f)
         {
-            stats_.hits_protecting++;  // voxel had accumulated misses and is now decayed
+            stats_.hits_protecting++;
             if (in_sector) stats_.sector_hits_protecting++;
         }
-        if (it->second.miss_count > 0)
-        {
-            --it->second.miss_count;
-        }
+
+        // Add occupied evidence, clamp to max
+        it->second.log_odds = std::min(
+            it->second.log_odds + lo_config_.log_odds_hit,
+            lo_config_.clamp_max);
     }
 }
 
 void VoxelHashMap::observeRay(
     const Eigen::Vector3f& origin,
-    const Eigen::Vector3f& endpoint)
+    const Eigen::Vector3f& endpoint,
+    float protection_radius)
 {
     // 3D-DDA (Amanatides & Woo) ray traversal
     VoxelKey start_key = toKey(origin.x(), origin.y(), origin.z());
@@ -117,11 +122,28 @@ void VoxelHashMap::observeRay(
 
     int max_steps = static_cast<int>(length * inv_voxel_size_) * 2 + 10;
 
+    // Precompute squared protection radius for efficient per-voxel sphere test.
+    const float prot_r_sq = protection_radius * protection_radius;
+
     int local_incremented = 0;
     for (int i = 0; i < max_steps; ++i)
     {
-        // Stop at endpoint — it is handled by observeHit (reset to 0).
-        // Only intermediate voxels (free space) get miss_count incremented.
+        // Protection sphere: stop ray before reaching voxels near endpoint.
+        if (prot_r_sq > 0.0f)
+        {
+            float vx = (cx + 0.5f) * voxel_size_;
+            float vy = (cy + 0.5f) * voxel_size_;
+            float vz = (cz + 0.5f) * voxel_size_;
+            float dx = endpoint.x() - vx;
+            float dy = endpoint.y() - vy;
+            float dz = endpoint.z() - vz;
+            if (dx * dx + dy * dy + dz * dz <= prot_r_sq)
+            {
+                break;
+            }
+        }
+
+        // Fallback exact-voxel stop
         if (cx == end_key.ix && cy == end_key.iy && cz == end_key.iz)
         {
             break;
@@ -131,28 +153,42 @@ void VoxelHashMap::observeRay(
         auto it = voxels_.find(cur);
         if (it != voxels_.end())
         {
-            bool from_zero = (it->second.miss_count == 0);
-            if (from_zero)
+            // Per-scan-cycle deduplication: each voxel receives at most
+            // one miss decrement per scan cycle, preventing multiple rays
+            // from overwhelming a single voxel in one update.
+            if (it->second.last_miss_scan_id != scan_id_)
             {
-                stats_.ray_from_zero++;  // first miss event for this voxel
-            }
-            if (it->second.miss_count < std::numeric_limits<uint16_t>::max())
-            {
-                it->second.miss_count++;
-            }
-            stats_.ray_incremented++;
-            local_incremented++;
+                it->second.last_miss_scan_id = scan_id_;
+                bool was_positive = (it->second.log_odds >= 0.0f);
 
-            if (sector_enabled_)
-            {
-                float vx = (cx + 0.5f) * voxel_size_;
-                float vy = (cy + 0.5f) * voxel_size_;
-                float vz = (cz + 0.5f) * voxel_size_;
-                if (inFrontalSector(vx, vy, vz))
+                it->second.log_odds = std::max(
+                    it->second.log_odds - lo_config_.log_odds_miss,
+                    lo_config_.clamp_min);
+
+                stats_.ray_incremented++;
+                local_incremented++;
+
+                if (was_positive && it->second.log_odds < 0.0f)
                 {
-                    stats_.sector_ray_incremented++;
-                    if (from_zero) stats_.sector_ray_from_zero++;
+                    stats_.ray_from_zero++;  // crossed zero boundary
                 }
+
+                if (sector_enabled_)
+                {
+                    float vx = (cx + 0.5f) * voxel_size_;
+                    float vy = (cy + 0.5f) * voxel_size_;
+                    float vz = (cz + 0.5f) * voxel_size_;
+                    if (inFrontalSector(vx, vy, vz))
+                    {
+                        stats_.sector_ray_incremented++;
+                        if (was_positive && it->second.log_odds < 0.0f)
+                            stats_.sector_ray_from_zero++;
+                    }
+                }
+            }
+            else
+            {
+                stats_.ray_dedup_skips++;
             }
         }
         else
@@ -196,13 +232,13 @@ void VoxelHashMap::observeRay(
     }
 }
 
-std::vector<BoxPointType> VoxelHashMap::collectExpired(uint16_t threshold)
+std::vector<BoxPointType> VoxelHashMap::collectExpired()
 {
     std::vector<BoxPointType> expired;
     auto it = voxels_.begin();
     while (it != voxels_.end())
     {
-        if (it->second.miss_count > threshold)
+        if (it->second.log_odds < lo_config_.free_threshold)
         {
             expired.push_back(keyToBox(it->first));
             it = voxels_.erase(it);
@@ -262,22 +298,23 @@ size_t VoxelHashMap::size() const
     return voxels_.size();
 }
 
-uint16_t VoxelHashMap::maxMissCount() const
+float VoxelHashMap::minLogOdds() const
 {
-    uint16_t max_mc = 0;
+    float min_lo = 999.0f;
     for (const auto& [key, data] : voxels_)
     {
-        if (data.miss_count > max_mc)
+        if (data.log_odds < min_lo)
         {
-            max_mc = data.miss_count;
+            min_lo = data.log_odds;
         }
     }
-    return max_mc;
+    return min_lo;
 }
 
 void VoxelHashMap::resetStats()
 {
     stats_ = VoxelStats{};
+    ++scan_id_;  // advance to new scan cycle for miss dedup
 }
 
 const VoxelStats& VoxelHashMap::getStats() const
@@ -285,25 +322,25 @@ const VoxelStats& VoxelHashMap::getStats() const
     return stats_;
 }
 
-MissHistogram VoxelHashMap::getMissHistogram() const
+LogOddsHistogram VoxelHashMap::getLogOddsHistogram() const
 {
-    MissHistogram h;
+    LogOddsHistogram h;
     for (const auto& [key, data] : voxels_)
     {
-        uint16_t mc = data.miss_count;
-        if (mc == 0)
-            h.bin_0++;
-        else if (mc <= 3)
-            h.bin_1_3++;
-        else if (mc <= 6)
-            h.bin_4_6++;
-        else if (mc <= 9)
-            h.bin_7_9++;
+        float lo = data.log_odds;
+        if (lo >= 2.0f)
+            h.bin_strong_occ++;
+        else if (lo >= 1.0f)
+            h.bin_occ++;
+        else if (lo >= 0.0f)
+            h.bin_weak_occ++;
+        else if (lo >= lo_config_.free_threshold)
+            h.bin_uncertain++;
         else
-            h.bin_ge10++;
+            h.bin_free++;
 
-        if (mc > h.max_miss)
-            h.max_miss = mc;
+        if (lo < h.min_log_odds)
+            h.min_log_odds = lo;
 
         h.total++;
     }

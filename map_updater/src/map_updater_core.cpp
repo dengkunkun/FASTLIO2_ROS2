@@ -1,6 +1,7 @@
 #include "map_updater_core.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <pcl/point_types.h>
 #include <iostream>
 
@@ -17,7 +18,8 @@ MapUpdaterCore::MapUpdaterCore(const CoreConfig& config)
     }
 
     voxel_map_ = std::make_unique<VoxelHashMap>(
-        static_cast<float>(config_.removal_resolution));
+        static_cast<float>(config_.removal_resolution),
+        config_.log_odds);
 }
 
 bool MapUpdaterCore::loadPCD(const std::string& path)
@@ -53,7 +55,9 @@ bool MapUpdaterCore::loadPCD(const std::string& path)
     buildTree(points);
 
     // Initialize voxel_map with loaded points so observeRay can detect
-    // stale voxels from the initial PCD
+    // stale voxels from the initial PCD.  Each observeHit creates a voxel
+    // with initial_log_odds; multiple PCD points in the same voxel will
+    // accumulate additional log_odds_hit evidence up to clamp_max.
     for (const auto& pt : points)
     {
         voxel_map_->observeHit(pt.x, pt.y, pt.z);
@@ -73,13 +77,41 @@ bool MapUpdaterCore::savePCD(const std::string& path) const
         std::cerr << "[MapUpdaterCore] No points to save\n";
         return false;
     }
-    if (pcl::io::savePCDFileBinary(path, *cloud) != 0)
+
+    // If path is a directory, append default filename.
+    std::string file_path = path;
+    if (std::filesystem::is_directory(file_path))
     {
-        std::cerr << "[MapUpdaterCore] Failed to save PCD: " << path << "\n";
+        file_path = (std::filesystem::path(file_path) / "map.pcd").string();
+        std::cout << "[MapUpdaterCore] Path is directory, saving to: "
+                  << file_path << "\n";
+    }
+
+    // Ensure parent directory exists.
+    auto parent = std::filesystem::path(file_path).parent_path();
+    if (!parent.empty())
+    {
+        std::filesystem::create_directories(parent);
+    }
+
+    try
+    {
+        if (pcl::io::savePCDFileBinary(file_path, *cloud) != 0)
+        {
+            std::cerr << "[MapUpdaterCore] Failed to save PCD: "
+                      << file_path << "\n";
+            return false;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "[MapUpdaterCore] Exception saving PCD: " << e.what()
+                  << "\n";
         return false;
     }
+
     std::cout << "[MapUpdaterCore] Saved " << cloud->size()
-              << " points to " << path << "\n";
+              << " points to " << file_path << "\n";
     return true;
 }
 
@@ -108,45 +140,82 @@ int MapUpdaterCore::addPoints(PointVec& map_frame_points)
     {
         return 0;
     }
-    // ikd-tree Add_Points with downsample_on=true handles per-voxel dedup
-    int added = ikdtree_->Add_Points(map_frame_points, true);
+
+    // Only add points to voxels where the map has NO existing coverage.
+    // ikd-tree's Add_Points(..., downsample=true) keeps only 1 point per
+    // map_resolution voxel, which destroys the original map's density.
+    // By filtering out points near existing map points, we preserve density
+    // while still extending the map into genuinely new areas.
+    float min_dist = static_cast<float>(config_.map_resolution) * 0.5f;
+    float min_dist_sq = min_dist * min_dist;
+
+    PointVec new_area_points;
+    new_area_points.reserve(map_frame_points.size());
+
+    PointVec nearest(1);
+    std::vector<float> dist_sq(1);
+
+    for (const auto& pt : map_frame_points)
+    {
+        nearest.clear();
+        dist_sq.clear();
+        ikdtree_->Nearest_Search(pt, 1, nearest, dist_sq, min_dist);
+
+        if (nearest.empty() || dist_sq[0] > min_dist_sq)
+        {
+            // No existing map point within map_resolution/2 — new area
+            new_area_points.push_back(pt);
+        }
+    }
+
+    if (new_area_points.empty())
+    {
+        return 0;
+    }
+
+    int added = ikdtree_->Add_Points(new_area_points, true);
     return added;
 }
 
 int MapUpdaterCore::rayCastAndRemove(
     const Eigen::Vector3f& sensor_origin,
     const PointVec& endpoints,
-    int skip,
-    int miss_threshold)
+    int skip)
 {
     if (!voxel_map_ || endpoints.empty() || skip < 1)
     {
         return 0;
     }
 
-    // Reset per-batch stats before this cycle
+    // Reset per-batch stats and advance scan cycle ID for miss dedup
     voxel_map_->resetStats();
 
     // Phase 1: observeHit ALL endpoints to protect active surface voxels.
-    // This ensures every voxel receiving a current scan hit has miss_count
-    // reset to 0, preventing false removal of visible surfaces.
+    // This adds occupied evidence (log_odds_hit) to each endpoint's voxel,
+    // ensuring current scan surfaces maintain high occupancy belief.
     for (const auto& ep : endpoints)
     {
         voxel_map_->observeHit(ep.x, ep.y, ep.z);
     }
 
     // Phase 2: observeRay for sampled endpoints only (skip controls CPU cost).
-    // Rays traverse intermediate voxels, incrementing miss_count for voxels
-    // that exist in the map but are NOT current scan endpoints (stale voxels).
+    // Rays traverse intermediate voxels, subtracting log_odds_miss from each.
+    // Per-scan deduplication ensures each voxel is decremented at most once.
+    // A protection sphere around each endpoint prevents miss evidence on
+    // wall voxels adjacent to the scanned surface.
     for (size_t i = 0; i < endpoints.size(); i += static_cast<size_t>(skip))
     {
         const auto& ep = endpoints[i];
         Eigen::Vector3f endpoint(ep.x, ep.y, ep.z);
-        voxel_map_->observeRay(sensor_origin, endpoint);
+        float ray_length = (endpoint - sensor_origin).norm();
+        float protection_radius =
+            static_cast<float>(config_.endpoint_protection_base) +
+            ray_length * static_cast<float>(config_.endpoint_protection_angle_factor);
+        voxel_map_->observeRay(sensor_origin, endpoint, protection_radius);
     }
 
-    auto expired = voxel_map_->collectExpired(
-        static_cast<uint16_t>(miss_threshold));
+    // Phase 3: collect and delete voxels whose log_odds fell below free_threshold
+    auto expired = voxel_map_->collectExpired();
 
     int removed = 0;
     if (!expired.empty())
@@ -212,9 +281,9 @@ size_t MapUpdaterCore::voxelMapSize() const
     return voxel_map_ ? voxel_map_->size() : 0;
 }
 
-uint16_t MapUpdaterCore::maxMissCount() const
+float MapUpdaterCore::minLogOdds() const
 {
-    return voxel_map_ ? voxel_map_->maxMissCount() : 0;
+    return voxel_map_ ? voxel_map_->minLogOdds() : 0.0f;
 }
 
 void MapUpdaterCore::resetVoxelStats()
@@ -228,9 +297,9 @@ VoxelStats MapUpdaterCore::getVoxelStats() const
     return voxel_map_ ? voxel_map_->getStats() : VoxelStats{};
 }
 
-MissHistogram MapUpdaterCore::getMissHistogram() const
+LogOddsHistogram MapUpdaterCore::getLogOddsHistogram() const
 {
-    return voxel_map_ ? voxel_map_->getMissHistogram() : MissHistogram{};
+    return voxel_map_ ? voxel_map_->getLogOddsHistogram() : LogOddsHistogram{};
 }
 
 void MapUpdaterCore::setVoxelFrontalSector(const Eigen::Vector3f& origin,

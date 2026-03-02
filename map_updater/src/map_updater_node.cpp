@@ -1,8 +1,10 @@
 #include "map_updater_node.hpp"
 
 #include <pcl/point_cloud.h>
+#include <pcl/common/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <yaml-cpp/yaml.h>
+#include <tf2_eigen/tf2_eigen.hpp>
 
 #include <filesystem>
 #include <functional>
@@ -13,12 +15,31 @@ MapUpdaterNode::MapUpdaterNode(const rclcpp::NodeOptions& options)
     loadConfig();
 
     CoreConfig core_cfg;
-    core_cfg.map_resolution = config_.map_resolution;
-    core_cfg.scan_resolution = config_.scan_resolution;
-    core_cfg.removal_resolution = config_.removal_resolution;
+    core_cfg.map_resolution                    = config_.map_resolution;
+    core_cfg.scan_resolution                   = config_.scan_resolution;
+    core_cfg.removal_resolution                = config_.removal_resolution;
+    core_cfg.log_odds.log_odds_hit             = config_.log_odds_hit;
+    core_cfg.log_odds.log_odds_miss            = config_.log_odds_miss;
+    core_cfg.log_odds.clamp_max                = config_.log_odds_clamp_max;
+    core_cfg.log_odds.clamp_min                = config_.log_odds_clamp_min;
+    core_cfg.log_odds.free_threshold           = config_.log_odds_free_threshold;
+    core_cfg.log_odds.initial_log_odds         = config_.log_odds_initial;
+    core_cfg.endpoint_protection_base          = config_.endpoint_protection_base;
+    core_cfg.endpoint_protection_angle_factor  = config_.endpoint_protection_angle_factor;
     core_ = std::make_unique<MapUpdaterCore>(core_cfg);
 
     loadInitialMap();
+
+    // Initialize TF if scan_frame != map_frame
+    need_tf_transform_ = (config_.scan_frame != config_.map_frame);
+    if (need_tf_transform_)
+    {
+        tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        RCLCPP_INFO(get_logger(),
+                    "TF transform enabled: %s -> %s",
+                    config_.scan_frame.c_str(), config_.map_frame.c_str());
+    }
 
     map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         "updated_map", rclcpp::QoS(1).transient_local());
@@ -48,10 +69,11 @@ MapUpdaterNode::MapUpdaterNode(const rclcpp::NodeOptions& options)
     process_thread_ = std::thread(&MapUpdaterNode::processLoop, this);
 
     RCLCPP_INFO(get_logger(),
-                "MapUpdaterNode started. scan_topic=%s odom_topic=%s map_frame=%s "
+                "MapUpdaterNode started. scan_topic=%s odom_topic=%s "
+                "scan_frame=%s map_frame=%s "
                 "map_resolution=%.2f removal_resolution=%.3f publish_rate=%.1fHz",
                 config_.scan_topic.c_str(), config_.odom_topic.c_str(),
-                config_.map_frame.c_str(),
+                config_.scan_frame.c_str(), config_.map_frame.c_str(),
                 config_.map_resolution, config_.removal_resolution,
                 config_.publish_rate_hz);
 }
@@ -98,6 +120,8 @@ void MapUpdaterNode::loadConfig()
         get("scan_topic", std::string("/fastlio2/world_cloud"));
     config_.odom_topic =
         get("odom_topic", std::string("/fastlio2/lio_odom"));
+    config_.scan_frame =
+        get("scan_frame", std::string("camera_init"));
     config_.scan_process_interval_s = get("scan_process_interval_s", 0.5);
     config_.map_resolution = get("map_resolution", 0.2);
     config_.scan_resolution = get("scan_resolution", 0.15);
@@ -107,8 +131,15 @@ void MapUpdaterNode::loadConfig()
     config_.diag_sector_radius_m = get("diag_sector_radius_m", 6.0);
     config_.diag_sector_fov_deg = get("diag_sector_fov_deg", 90.0);
     config_.enable_point_removal = get("enable_point_removal", false);
-    config_.miss_count_threshold = get("miss_count_threshold", 20);
-    config_.ray_cast_skip = get("ray_cast_skip", 10);
+    config_.ray_cast_skip           = get("ray_cast_skip", 10);
+    config_.log_odds_hit            = get("log_odds_hit", 0.847f);
+    config_.log_odds_miss           = get("log_odds_miss", 0.405f);
+    config_.log_odds_clamp_max      = get("log_odds_clamp_max", 3.5f);
+    config_.log_odds_clamp_min      = get("log_odds_clamp_min", -2.0f);
+    config_.log_odds_free_threshold = get("log_odds_free_threshold", -1.0f);
+    config_.log_odds_initial        = get("log_odds_initial", 2.0f);
+    config_.endpoint_protection_base         = get("endpoint_protection_base_m", 0.1);
+    config_.endpoint_protection_angle_factor = get("endpoint_protection_angle_factor", 0.003);
 
     RCLCPP_INFO(get_logger(), "Config loaded from %s", config_path.c_str());
 }
@@ -197,12 +228,43 @@ void MapUpdaterNode::onLidarScan(
         return;
     }
 
+    // Transform cloud and sensor origin from scan_frame to map_frame if needed.
+    if (need_tf_transform_)
+    {
+        geometry_msgs::msg::TransformStamped tf_stamped;
+        try
+        {
+            tf_stamped = tf_buffer_->lookupTransform(
+                config_.map_frame, config_.scan_frame,
+                tf2::TimePointZero);
+        }
+        catch (const tf2::TransformException& ex)
+        {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "TF %s->%s not available: %s",
+                                 config_.scan_frame.c_str(),
+                                 config_.map_frame.c_str(), ex.what());
+            return;
+        }
+
+        Eigen::Isometry3d tf_eigen =
+            tf2::transformToEigen(tf_stamped.transform);
+        Eigen::Affine3f tf_f = tf_eigen.cast<float>();
+
+        pcl::transformPointCloud(*cloud_raw, *cloud_raw, tf_f);
+
+        // Transform sensor origin and orientation to map_frame.
+        sensor_origin = tf_f * sensor_origin;
+        Eigen::Quaternionf tf_rot(tf_f.rotation());
+        sensor_orientation = tf_rot * sensor_orientation;
+    }
+
     // Optional pre-filter (VoxelGrid downsampling).
     // world_cloud is already filtered by livox2PCL's filter_num,
     // but not by scan_resolution VoxelGrid.
     CloudType::Ptr cloud_filtered = core_->preFilterScan(cloud_raw);
 
-    // Points are already in world frame (camera_init) — no TF transform needed.
+    // Points are now in map_frame (transformed above if scan_frame != map_frame).
     PointVec map_points;
     map_points.reserve(cloud_filtered->size());
     for (const auto& pt : cloud_filtered->points)
@@ -227,12 +289,12 @@ void MapUpdaterNode::onLidarScan(
         sensor_forward.normalize();
     }
 
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                         "Scan processed: raw=%zu filtered=%zu "
-                         "sensor_origin=(%.2f,%.2f,%.2f)",
-                         cloud_raw->size(), map_points.size(),
-                         sensor_origin.x(), sensor_origin.y(),
-                         sensor_origin.z());
+    RCLCPP_INFO(get_logger(),
+                "Scan processed: raw=%zu filtered=%zu "
+                "sensor_origin=(%.2f,%.2f,%.2f)",
+                cloud_raw->size(), map_points.size(),
+                sensor_origin.x(), sensor_origin.y(),
+                sensor_origin.z());
 
     {
         std::lock_guard<std::mutex> lock(data_mutex_);
@@ -337,11 +399,11 @@ void MapUpdaterNode::doIncrementalAdd(PointVec& points)
     scans_processed_++;
     points_added_total_ += static_cast<uint64_t>(added);
 
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                         "addPoints: input=%zu ikd_added=%d "
-                         "map_before=%d map_after=%d delta=%d",
-                         points.size(), added, before, after,
-                         after - before);
+    RCLCPP_INFO(get_logger(),
+                "addPoints: input=%zu ikd_added=%d "
+                "map_before=%d map_after=%d delta=%d",
+                points.size(), added, before, after,
+                after - before);
 }
 
 void MapUpdaterNode::doPointRemoval(
@@ -358,7 +420,7 @@ void MapUpdaterNode::doPointRemoval(
     int before = core_->validNum();
     int removed = core_->rayCastAndRemove(
         origin, endpoints,
-        config_.ray_cast_skip, config_.miss_count_threshold);
+        config_.ray_cast_skip);
     int after = core_->validNum();
     points_removed_total_ += static_cast<uint64_t>(removed);
 
@@ -367,20 +429,20 @@ void MapUpdaterNode::doPointRemoval(
     RCLCPP_INFO(get_logger(),
                 "pointRemoval: endpoints=%zu rays=%zu "
                 "expired_removed=%d map_before=%d map_after=%d "
-                "max_miss=%u voxels=%zu",
+                "min_logodds=%.2f voxels=%zu",
                 endpoints.size(),
                 endpoints.size() / std::max(config_.ray_cast_skip, 1),
                 removed, before, after,
-                core_->maxMissCount(), core_->voxelMapSize());
+                core_->minLogOdds(), core_->voxelMapSize());
 
     RCLCPP_INFO(get_logger(),
                 "  rayStats: hit(new=%d exist=%d protect=%d) "
                 "rays(cast=%d same_key=%d productive=%d) "
-                "steps(total=%d incr=%d from_zero=%d not_in_map=%d)",
+                "steps(total=%d decr=%d cross_zero=%d not_in_map=%d dedup=%d)",
                 stats.hit_new, stats.hit_existing, stats.hits_protecting,
                 stats.ray_count, stats.ray_same_key, stats.rays_productive,
                 stats.ray_steps, stats.ray_incremented, stats.ray_from_zero,
-                stats.ray_not_in_map);
+                stats.ray_not_in_map, stats.ray_dedup_skips);
 
     // Sector stats: front radius/FOV region for obstacle-area cycling analysis.
     RCLCPP_INFO(get_logger(),
@@ -419,20 +481,21 @@ void MapUpdaterNode::publishUpdatedMap()
 void MapUpdaterNode::logDiagnostics()
 {
     RCLCPP_INFO(get_logger(),
-                "Diag: valid=%d tree=%d voxels=%zu max_miss=%u "
+                "Diag: valid=%d tree=%d voxels=%zu min_logodds=%.2f "
                 "scans(recv=%lu proc=%lu drop_no_odom=%lu) "
                 "pts_added=%lu pts_removed=%lu",
                 core_->validNum(), core_->treeSize(), core_->voxelMapSize(),
-                core_->maxMissCount(),
+                core_->minLogOdds(),
                 scans_received_, scans_processed_, scans_dropped_no_odom_,
                 points_added_total_, points_removed_total_);
 
-    auto hist = core_->getMissHistogram();
+    auto hist = core_->getLogOddsHistogram();
     RCLCPP_INFO(get_logger(),
-                "  missHist: [0]=%d [1-3]=%d [4-6]=%d [7-9]=%d [>=10]=%d "
-                "total=%d max=%u",
-                hist.bin_0, hist.bin_1_3, hist.bin_4_6, hist.bin_7_9,
-                hist.bin_ge10, hist.total, hist.max_miss);
+                "  logOdds: [>=2.0]=%d [1-2)=%d [0-1)=%d [neg]=%d [<free]=%d "
+                "total=%d min=%.2f",
+                hist.bin_strong_occ, hist.bin_occ, hist.bin_weak_occ,
+                hist.bin_uncertain, hist.bin_free,
+                hist.total, hist.min_log_odds);
 }
 
 void MapUpdaterNode::handleSaveMap(

@@ -13,6 +13,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include "interface/srv/save_maps.hpp"
 
@@ -23,6 +25,7 @@ struct MapUpdaterConfig
 
     std::string scan_topic = "/fastlio2/world_cloud";
     std::string odom_topic = "/fastlio2/lio_odom";
+    std::string scan_frame = "camera_init";  // frame of scan_topic & odom_topic
     double scan_process_interval_s = 0.5;
 
     double map_resolution = 0.2;
@@ -35,8 +38,18 @@ struct MapUpdaterConfig
     double diag_sector_fov_deg = 90.0;
 
     bool enable_point_removal = false;
-    int miss_count_threshold = 20;
     int ray_cast_skip = 10;
+
+    // Log-odds occupancy model (OctoMap-inspired)
+    float log_odds_hit  = 0.847f;
+    float log_odds_miss = 0.405f;
+    float log_odds_clamp_max = 3.5f;
+    float log_odds_clamp_min = -2.0f;
+    float log_odds_free_threshold = -1.0f;
+    float log_odds_initial = 2.0f;
+
+    double endpoint_protection_base         = 0.1;
+    double endpoint_protection_angle_factor = 0.003;
 };
 
 class MapUpdaterNode : public rclcpp::Node
@@ -77,6 +90,11 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
     rclcpp::Service<interface::srv::SaveMaps>::SharedPtr save_srv_;
     rclcpp::Service<interface::srv::SaveMaps>::SharedPtr reload_srv_;
+
+    // TF (for scan_frame → map_frame transform when they differ)
+    std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    bool need_tf_transform_ = false;  // true when scan_frame != map_frame
 
     // Odometry cache (protected by odom_mutex_)
     std::mutex odom_mutex_;

@@ -29,9 +29,30 @@ struct VoxelKeyHash
     }
 };
 
+/// Log-odds probabilistic occupancy model configuration.
+/// Inspired by OctoMap: asymmetric hit/miss evidence with clamping.
+///
+/// Key insight: hit evidence (+0.847) is ~2x stronger than miss evidence
+/// (-0.405).  A well-observed wall at clamp_max (3.5) needs ~11 consecutive
+/// single-miss scans to cross free_threshold (-1.0), while a genuine dynamic
+/// obstacle is cleared in a few seconds.
+///
+/// Per-scan deduplication ensures each voxel receives at most one miss per
+/// scan cycle, preventing multiple rays from overwhelming a single voxel.
+struct LogOddsConfig
+{
+    float log_odds_hit  = 0.847f;    // logodds(0.7): occupied evidence per hit
+    float log_odds_miss = 0.405f;    // |logodds(0.4)|: free evidence per miss (positive)
+    float clamp_max     = 3.5f;      // logodds(0.971): max occupancy belief
+    float clamp_min     = -2.0f;     // logodds(0.1192): max free belief
+    float free_threshold = -1.0f;    // voxel deleted when log_odds < this
+    float initial_log_odds = 2.0f;   // starting belief for newly created voxels
+};
+
 struct VoxelData
 {
-    uint16_t miss_count = 0;
+    float log_odds = 0.0f;           // occupancy belief: >0 = occupied, <0 = free
+    uint32_t last_miss_scan_id = 0;  // per-scan-cycle miss deduplication
 };
 
 /// Per-batch statistics for diagnosing ray cast behavior
@@ -39,87 +60,87 @@ struct VoxelStats
 {
     int hit_new = 0;           // observeHit: new voxels created
     int hit_existing = 0;      // observeHit: existing voxels found
-    int hits_protecting = 0;   // observeHit: hit a voxel that had miss_count > 0
+    int hits_protecting = 0;   // observeHit: hit a voxel with log_odds < 0 (recovering)
     int ray_count = 0;         // observeRay calls executed (excluding same-key skips)
     int ray_same_key = 0;      // observeRay calls skipped (start_key == end_key)
     int ray_steps = 0;         // Total intermediate voxel cells visited across all rays
-    int ray_incremented = 0;   // Steps where voxel existed in map and was incremented
-    int ray_from_zero = 0;     // Steps where voxel was incremented from miss_count==0 (fresh tagging)
+    int ray_incremented = 0;   // Unique voxels that received miss evidence this cycle
+    int ray_from_zero = 0;     // Voxels that crossed from positive to negative log_odds
     int ray_not_in_map = 0;    // Steps where voxel cell had no entry in map
-    int rays_productive = 0;   // Rays that incremented at least one voxel
+    int rays_productive = 0;   // Rays that decremented at least one voxel
+    int ray_dedup_skips = 0;   // Miss updates skipped (already updated this scan cycle)
 
     // Sector-specific counters (front radius/FOV around sensor)
-    int sector_hit_new = 0;          // New voxels created inside sector
-    int sector_hit_existing = 0;     // Endpoint hits on existing voxels inside sector
-    int sector_hits_protecting = 0;  // Cycling resets inside sector
-    int sector_ray_incremented = 0;  // Ray increments inside sector
-    int sector_ray_from_zero = 0;    // Fresh-tag events inside sector
+    int sector_hit_new = 0;
+    int sector_hit_existing = 0;
+    int sector_hits_protecting = 0;
+    int sector_ray_incremented = 0;
+    int sector_ray_from_zero = 0;
 };
 
-/// Histogram of miss_count distribution across all voxels
-struct MissHistogram
+/// Log-odds distribution histogram across all voxels
+struct LogOddsHistogram
 {
-    int bin_0 = 0;        // miss_count == 0
-    int bin_1_3 = 0;      // 1 <= miss_count <= 3
-    int bin_4_6 = 0;      // 4 <= miss_count <= 6
-    int bin_7_9 = 0;      // 7 <= miss_count <= 9
-    int bin_ge10 = 0;     // miss_count >= 10
-    uint16_t max_miss = 0;
+    int bin_strong_occ = 0;   // log_odds >= 2.0  (stable walls)
+    int bin_occ = 0;          // 1.0 <= log_odds < 2.0
+    int bin_weak_occ = 0;     // 0.0 <= log_odds < 1.0
+    int bin_uncertain = 0;    // free_threshold <= log_odds < 0.0  (trending free)
+    int bin_free = 0;         // log_odds < free_threshold (should be 0 after collectExpired)
+    float min_log_odds = 999.0f;
     int total = 0;
 };
 
 class VoxelHashMap
 {
 public:
-    explicit VoxelHashMap(float voxel_size);
+    explicit VoxelHashMap(float voxel_size,
+                          const LogOddsConfig& config = LogOddsConfig{});
 
-    /// Register an endpoint hit; creates voxel if not existing, resets
-    /// miss_count to 0 for existing voxels (protects active surfaces)
+    /// Register an endpoint hit. Creates voxel with initial_log_odds if
+    /// not existing, adds log_odds_hit to existing voxels (clamped to max).
     void observeHit(float x, float y, float z);
 
-    /// Increment miss_count for all traversed voxels between origin and endpoint
-    /// (excluding the endpoint voxel) using 3D-DDA ray traversal
+    /// Apply miss evidence along a ray from origin to endpoint using 3D-DDA.
+    /// Each voxel receives at most one miss decrement per scan cycle
+    /// (per-scan deduplication prevents multiple rays from overwhelming a voxel).
+    /// Voxels within protection_radius of the endpoint are skipped.
     void observeRay(const Eigen::Vector3f& origin,
-                    const Eigen::Vector3f& endpoint);
+                    const Eigen::Vector3f& endpoint,
+                    float protection_radius = 0.0f);
 
-    /// Return BoxPointType for each voxel exceeding threshold, remove from map
-    std::vector<BoxPointType> collectExpired(uint16_t threshold);
+    /// Delete voxels with log_odds below free_threshold, return their bounding boxes
+    std::vector<BoxPointType> collectExpired();
 
     void clear();
     size_t size() const;
-    uint16_t maxMissCount() const;
+    float minLogOdds() const;
 
-    /// Set a frontal sector (radius + FOV around origin and forward) for
-    /// targeted stats. Call before each rayCastAndRemove cycle.
-    /// Pass radius<=0 or invalid forward to disable.
     void setFrontalSector(const Eigen::Vector3f& origin,
                           const Eigen::Vector3f& forward,
                           float radius,
                           float fov_deg);
 
-    /// Reset per-batch diagnostic counters (call before each rayCastAndRemove)
+    /// Reset per-batch diagnostic counters and advance scan cycle ID.
+    /// Must be called before each rayCastAndRemove cycle.
     void resetStats();
-    /// Get accumulated stats since last resetStats()
     const VoxelStats& getStats() const;
-    /// Compute miss_count histogram over all current voxels
-    MissHistogram getMissHistogram() const;
+    LogOddsHistogram getLogOddsHistogram() const;
 
 private:
     VoxelKey toKey(float x, float y, float z) const;
     BoxPointType keyToBox(const VoxelKey& key) const;
-
-    /// Returns true if the voxel centre is within the configured frontal sector
     bool inFrontalSector(float x, float y, float z) const;
 
     float voxel_size_;
     float inv_voxel_size_;
+    LogOddsConfig lo_config_;
+    uint32_t scan_id_ = 0;  // per-scan-cycle counter for miss dedup
     std::unordered_map<VoxelKey, VoxelData, VoxelKeyHash> voxels_;
     VoxelStats stats_;
 
-    // Frontal sector for targeted stats
     bool sector_enabled_ = false;
     Eigen::Vector3f sector_origin_{Eigen::Vector3f::Zero()};
     Eigen::Vector3f sector_forward_{Eigen::Vector3f::UnitX()};
-    float sector_r2_ = 0.f;     // radius squared
+    float sector_r2_ = 0.f;
     float sector_cos_half_fov_ = 0.f;
 };

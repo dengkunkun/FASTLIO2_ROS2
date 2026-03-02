@@ -15,9 +15,15 @@ struct CoreConfig
     double map_resolution = 0.2;
     double scan_resolution = 0.15;
     /// Voxel size used by the removal hash map — independent of ikd-tree.
-    /// Finer than map_resolution to avoid person-trace voxels sharing a key
-    /// with adjacent wall endpoints (resolution overlap cycling).
     double removal_resolution = 0.05;
+
+    /// Log-odds occupancy model parameters (OctoMap-inspired).
+    LogOddsConfig log_odds;
+
+    /// Base protection sphere radius (m) around each scan endpoint.
+    double endpoint_protection_base = 0.1;
+    /// Distance-proportional component of the protection radius (m/m).
+    double endpoint_protection_angle_factor = 0.003;
 };
 
 class MapUpdaterCore
@@ -34,11 +40,10 @@ public:
     CloudType::Ptr preFilterScan(CloudType::Ptr raw_scan);
     int addPoints(PointVec& map_frame_points);
 
-    // Point removal (Phase 2)
+    // Point removal (log-odds based)
     int rayCastAndRemove(const Eigen::Vector3f& sensor_origin,
                          const PointVec& endpoints,
-                         int skip,
-                         int miss_threshold);
+                         int skip);
 
     // Map extraction
     CloudType::Ptr flattenToCloud() const;
@@ -47,12 +52,12 @@ public:
     int validNum() const;
     int treeSize() const;
     size_t voxelMapSize() const;
-    uint16_t maxMissCount() const;
+    float minLogOdds() const;
     void resetVoxelStats();
     VoxelStats getVoxelStats() const;
-    MissHistogram getMissHistogram() const;
+    LogOddsHistogram getLogOddsHistogram() const;
 
-    /// Set frontal sector for targeted per-scan stats (radius ≤ 0 disables)
+    /// Set frontal sector for targeted per-scan stats (radius <= 0 disables)
     void setVoxelFrontalSector(const Eigen::Vector3f& origin,
                                const Eigen::Vector3f& forward,
                                float radius,
