@@ -67,6 +67,41 @@ void VoxelHashMap::observeHit(float x, float y, float z)
             it->second.log_odds + lo_config_.log_odds_hit,
             lo_config_.clamp_max);
     }
+
+    // 26-neighbor hit propagation: protect adjacent voxels that are part of
+    // the same physical surface but not directly hit by any scan endpoint.
+    // At scan_resolution=0.15m and voxel=0.05m, there are ~3 voxels between
+    // adjacent endpoints.  Without neighbor propagation, intermediate voxels
+    // never receive hit evidence and will eventually be eroded by miss rays.
+    // Only updates EXISTING voxels — does not create phantom voxels.
+    for (int32_t dx = -1; dx <= 1; ++dx)
+    {
+        for (int32_t dy = -1; dy <= 1; ++dy)
+        {
+            for (int32_t dz = -1; dz <= 1; ++dz)
+            {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+
+                VoxelKey nk{key.ix + dx, key.iy + dy, key.iz + dz};
+                auto nit = voxels_.find(nk);
+                if (nit != voxels_.end())
+                {
+                    nit->second.log_odds = std::min(
+                        nit->second.log_odds + lo_config_.log_odds_hit,
+                        lo_config_.clamp_max);
+                    stats_.hit_neighbor++;
+                    if (sector_enabled_)
+                    {
+                        float nvx = (nk.ix + 0.5f) * voxel_size_;
+                        float nvy = (nk.iy + 0.5f) * voxel_size_;
+                        float nvz = (nk.iz + 0.5f) * voxel_size_;
+                        if (inFrontalSector(nvx, nvy, nvz))
+                            stats_.sector_hit_neighbor++;
+                    }
+                }
+            }
+        }
+    }
 }
 
 void VoxelHashMap::observeRay(

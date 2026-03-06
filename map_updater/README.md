@@ -43,10 +43,21 @@
 1. **不对称更新**: hit >> miss，稳定墙面天然抵抗误删
 2. **Per-scan 去重**: 同一体素每帧最多 1 次 miss，防止多射线在一帧内压倒一个体素
 3. **Clamping**: log-odds 限制在 `[clamp_min, clamp_max]`，防止无限累积
-4. **端点保护球**: 射线在端点附近提前停止，避免 VoxelGrid 质心偏移导致误 miss
+4. **26-邻域 hit 传播**: 端点命中体素时，同时向 26 个相邻体素（3×3×3 立方体）注入 hit 证据。因 scan_resolution(0.15m) > voxel_size(0.05m)，端点之间存在 ~3 个体素间隙永远不会被直接命中；邻域传播确保这些间隙体素也获得正向证据，不会被 miss 射线侵蚀。仅更新已有体素，不创建幻象体素。
+5. **端点保护球**: 射线在端点附近提前停止，避免 VoxelGrid 质心偏移导致误 miss（二级防线，与 26-邻域互补）
 
 ### addPoints 密度保护
-`addPoints` 在添加扫描点前，逐点检查 ikd-tree 中 `map_resolution/2` 范围内是否已有地图点。仅向**空白区域**添加新点，防止 ikd-tree 的体素降采样 (`Add_Points(..., downsample=true)`) 破坏原始地图密度。
+`addPoints` 在添加扫描点前，逐点检查 ikd-tree 中 `map_resolution/2` 范围内是否已有地图点。仅向**空白区域**添加新点（`Add_Points(..., false)`），防止 ikd-tree 的体素降采样破坏原始地图密度。
+
+**与 FASTLIO2 的对比：**
+
+| | FASTLIO2 `incrCloudMap()` | map_updater `addPoints()` |
+|---|---|---|
+| 空白区域 | 添加 (`downsample=false`) | 添加 (`downsample=false`) ✓ |
+| 已有覆盖，新点更优 | 替换 (`downsample=true`) | **跳过** |
+| 已有覆盖，旧点更优 | 跳过 | **跳过** |
+
+差异原因：FASTLIO2 主循环的目标是持续优化地图质量（选更接近体素中心的点），map_updater 的目标是**保持已建图密度**，仅扩展新区域。因此 map_updater 不做"更优点替换"。副作用：被射线误删的点不会被新扫描恢复。
 
 ## 配置参数
 

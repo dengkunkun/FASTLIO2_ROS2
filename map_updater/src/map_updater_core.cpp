@@ -173,7 +173,10 @@ int MapUpdaterCore::addPoints(PointVec& map_frame_points)
         return 0;
     }
 
-    int added = ikdtree_->Add_Points(new_area_points, true);
+    // Add with downsample_on=false: these points are in empty voxels with no
+    // existing neighbors, matching FASTLIO2's incrCloudMap() behavior that uses
+    // Add_Points(point_no_need_downsample, false) for genuinely new areas.
+    int added = ikdtree_->Add_Points(new_area_points, false);
     return added;
 }
 

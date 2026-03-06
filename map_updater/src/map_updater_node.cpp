@@ -436,22 +436,23 @@ void MapUpdaterNode::doPointRemoval(
                 core_->minLogOdds(), core_->voxelMapSize());
 
     RCLCPP_INFO(get_logger(),
-                "  rayStats: hit(new=%d exist=%d protect=%d) "
+                "  rayStats: hit(new=%d exist=%d protect=%d neighbor=%d) "
                 "rays(cast=%d same_key=%d productive=%d) "
                 "steps(total=%d decr=%d cross_zero=%d not_in_map=%d dedup=%d)",
                 stats.hit_new, stats.hit_existing, stats.hits_protecting,
+                stats.hit_neighbor,
                 stats.ray_count, stats.ray_same_key, stats.rays_productive,
                 stats.ray_steps, stats.ray_incremented, stats.ray_from_zero,
                 stats.ray_not_in_map, stats.ray_dedup_skips);
 
     // Sector stats: front radius/FOV region for obstacle-area cycling analysis.
     RCLCPP_INFO(get_logger(),
-                "  sector(%.1fm,%.0fdeg): hit(new=%d exist=%d protect=%d) "
+                "  sector(%.1fm,%.0fdeg): hit(new=%d exist=%d protect=%d neighbor=%d) "
                 "ray(incr=%d from_zero=%d) "
                 "protect_ratio=%.0f%%",
                 config_.diag_sector_radius_m, config_.diag_sector_fov_deg,
                 stats.sector_hit_new, stats.sector_hit_existing,
-                stats.sector_hits_protecting,
+                stats.sector_hits_protecting, stats.sector_hit_neighbor,
                 stats.sector_ray_incremented, stats.sector_ray_from_zero,
                 stats.sector_hit_existing > 0
                     ? 100.0 * stats.sector_hits_protecting / stats.sector_hit_existing

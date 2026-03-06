@@ -19,6 +19,8 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(interface REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_eigen REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
@@ -46,6 +48,8 @@ ament_target_dependencies(map_updater_component
   nav_msgs
   pcl_conversions
   interface
+  tf2_ros
+  tf2_eigen
 )
 target_link_libraries(map_updater_component
   ${PCL_LIBRARIES}

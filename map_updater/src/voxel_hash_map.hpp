@@ -61,6 +61,7 @@ struct VoxelStats
     int hit_new = 0;           // observeHit: new voxels created
     int hit_existing = 0;      // observeHit: existing voxels found
     int hits_protecting = 0;   // observeHit: hit a voxel with log_odds < 0 (recovering)
+    int hit_neighbor = 0;      // observeHit: 26-neighbor propagated hits on existing voxels
     int ray_count = 0;         // observeRay calls executed (excluding same-key skips)
     int ray_same_key = 0;      // observeRay calls skipped (start_key == end_key)
     int ray_steps = 0;         // Total intermediate voxel cells visited across all rays
@@ -74,6 +75,7 @@ struct VoxelStats
     int sector_hit_new = 0;
     int sector_hit_existing = 0;
     int sector_hits_protecting = 0;
+    int sector_hit_neighbor = 0;
     int sector_ray_incremented = 0;
     int sector_ray_from_zero = 0;
 };
