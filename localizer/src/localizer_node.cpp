@@ -439,25 +439,38 @@ public:
             V3D final_offset_t;
             
             if (skip_filter) {
+                // 质量门控：即使 skip_filter，refine_score 极差时仍拒绝
+                // 正常 refine_score ≈ 0.002，0.05 已是 25 倍退化
+                // 排除 service_received（relocalize 首次 ICP 初始猜测偏差大，score 较高属正常）
+                constexpr double SKIP_FILTER_MAX_REFINE_SCORE = 0.05;
+                if (!m_state.service_received && refine_score > SKIP_FILTER_MAX_REFINE_SCORE) {
+                    offset_rejected = true;
+                    RCLCPP_WARN(this->get_logger(),
+                        "[ICP_QUALITY_REJECT] skip_filter=true but refine_score=%.4f > %.4f, "
+                        "rejecting low-quality ICP result (warmup=%d has_valid=%d)",
+                        refine_score, SKIP_FILTER_MAX_REFINE_SCORE,
+                        in_warmup, m_state.has_valid_offset);
+                } else {
                 // 首次 / relocalize / force-accept / warmup: 直接使用 ICP 结果
                 final_offset_r = new_offset_r;
                 final_offset_t = new_offset_t;
-                
+
                 if (in_warmup) {
                     m_state.warmup_remaining--;
-                    RCLCPP_WARN(this->get_logger(), 
+                    RCLCPP_WARN(this->get_logger(),
                         "[WARMUP] Direct apply (remaining=%lu, refine_score=%.4f, dt_2d=%.4fm)",
                         m_state.warmup_remaining, refine_score, delta_offset_t_norm);
                 } else {
                     RCLCPP_WARN(this->get_logger(), "[EMA] Direct apply (alpha=1.0, refine_score=%.4f)", refine_score);
                 }
-                
+
                 // 初始 ICP 质量检查 — relocalize 后首次 ICP 质量差时警告
                 if (m_state.service_received && refine_score > 0.05) {
                     RCLCPP_WARN(this->get_logger(),
                         "[QUALITY_WARN] Initial ICP after relocalize has poor quality! "
                         "refine_score=%.4f (>0.05) — warmup phase will correct",
                         refine_score);
+                }
                 }
             } else if (!offset_rejected) {
                 // 正常 EMA 平滑

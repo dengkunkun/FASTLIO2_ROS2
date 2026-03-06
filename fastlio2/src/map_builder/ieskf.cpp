@@ -19,7 +19,12 @@ void State::operator+=(const V21D &delta)
     t_il += delta.segment<3>(9);
     v += delta.segment<3>(12);
     bg += delta.segment<3>(15);
+    // 饱和限制: 防止 LiDAR 特征退化期间偏差估计发散到物理不合理值
+    // MEMS 陀螺仪典型 bias ±0.01 rad/s，±0.1 rad/s 为 10x 余量
+    // MEMS 加速度计典型 bias ±0.1 m/s²，±2.0 m/s² 为 20x 余量
+    bg = bg.cwiseMax(V3D(-0.1, -0.1, -0.1)).cwiseMin(V3D(0.1, 0.1, 0.1));
     ba += delta.segment<3>(18);
+    ba = ba.cwiseMax(V3D(-2.0, -2.0, -2.0)).cwiseMin(V3D(2.0, 2.0, 2.0));
 }
 
 V21D State::operator-(const State &other) const

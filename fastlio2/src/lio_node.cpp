@@ -455,16 +455,18 @@ public:
         state.r_wi = new_rot;
         state.t_wi = new_pos;
         state.v = V3D::Zero();  // 重置速度
-        // 保留 bg/ba/g/r_il/t_il — 这些是标定量，不应重置
+        state.bg = V3D::Zero();  // 重置陀螺仪偏差（发散后必须清除）
+        state.ba = V3D::Zero();  // 重置加速度计偏差（发散后必须清除）
+        // 保留 g/r_il/t_il — 这些是真正的标定量
 
         // 2. 重置协方差到较大值 (让 IESKF 快速收敛到新位姿)
         m_kf->P().setIdentity();
         m_kf->P().block<3, 3>(0, 0) *= 0.01;  // rot: 0.01 rad^2
         m_kf->P().block<3, 3>(3, 3) *= 0.1;   // pos: 0.1 m^2
         m_kf->P().block<3, 3>(12, 12) *= 0.1;  // vel: 0.1 (m/s)^2
-        // bg/ba covariance 保持小值 (已标定)
-        m_kf->P().block<3, 3>(15, 15) *= 1e-6;
-        m_kf->P().block<3, 3>(18, 18) *= 1e-4;
+        // bg/ba: 给较大协方差，允许 IESKF 重新估计偏差
+        m_kf->P().block<3, 3>(15, 15) *= 0.001;  // bg: 允许重新收敛
+        m_kf->P().block<3, 3>(18, 18) *= 0.01;   // ba: 允许重新收敛
         // r_il/t_il covariance 保持小值 (已标定)
         m_kf->P().block<3, 3>(6, 6) *= 1e-6;
         m_kf->P().block<3, 3>(9, 9) *= 1e-6;
@@ -480,7 +482,7 @@ public:
 
         RCLCPP_WARN(this->get_logger(),
             "[RESET_STATE] IESKF reset to pose: t=(%.3f,%.3f,%.3f) "
-            "rpy=(%.1f,%.1f,%.1f)deg. Velocity zeroed, buffers cleared.",
+            "rpy=(%.1f,%.1f,%.1f)deg. Velocity/bg/ba zeroed, buffers cleared.",
             request->x, request->y, request->z,
             request->roll * 180.0 / M_PI,
             request->pitch * 180.0 / M_PI,
