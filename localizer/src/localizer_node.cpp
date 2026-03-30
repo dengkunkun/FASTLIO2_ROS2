@@ -42,6 +42,9 @@ struct NodeConfig
     double max_offset_jump_t = 0.8;      // 安全阈值: 超过此变化量完全拒绝 (m)
     double max_offset_jump_yaw = 15.0;   // 安全阈值: 超过此变化量完全拒绝 (deg)
     double offset_ema_alpha = 0.3;       // EMA 平滑因子 (0-1), 值越小越平滑
+    
+    // LIO reset_state 服务名 (须与 lio_node 的实际服务路径一致)
+    std::string lio_reset_service = "/fastlio2/reset_state";
 };
 
 // ============================================================================
@@ -153,7 +156,7 @@ public:
 
         // LIO reset_state client (for resetting IESKF after relocalize)
         m_lio_reset_client = this->create_client<interface::srv::ResetState>(
-            "/fastlio2/lio_node/reset_state");
+            m_config.lio_reset_service);
 
         // Timer for TF broadcasting (lightweight, stays in callback thread)
         m_tf_timer = this->create_wall_timer(10ms, std::bind(&LocalizerNode::tfTimerCB, this));
@@ -211,9 +214,14 @@ public:
         if (config["offset_ema_alpha"]) {
             m_config.offset_ema_alpha = std::clamp(config["offset_ema_alpha"].as<double>(), 0.01, 1.0);
         }
+        if (config["lio_reset_service"]) {
+            m_config.lio_reset_service = config["lio_reset_service"].as<std::string>();
+        }
         RCLCPP_INFO(this->get_logger(), 
             "[CONFIG] ICP offset filter: max_jump_t=%.3fm, max_jump_yaw=%.1fdeg, ema_alpha=%.2f",
             m_config.max_offset_jump_t, m_config.max_offset_jump_yaw, m_config.offset_ema_alpha);
+        RCLCPP_INFO(this->get_logger(), 
+            "[CONFIG] LIO reset service: %s", m_config.lio_reset_service.c_str());
     }
     
     // Lightweight timer callback - only handles TF broadcasting
@@ -435,8 +443,8 @@ public:
             }
             
             // 应用 EMA 平滑
-            M3D final_offset_r;
-            V3D final_offset_t;
+            M3D final_offset_r = m_state.last_offset_r;
+            V3D final_offset_t = m_state.last_offset_t;
             
             if (skip_filter) {
                 // 质量门控：即使 skip_filter，refine_score 极差时仍拒绝
@@ -659,9 +667,8 @@ public:
         m_state.new_data_available = true;
         
         // 诊断日志：每5秒输出一次 FAST-LIO2 的原始里程计
-        static auto last_odom_log_time = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_odom_log_time).count() >= 5) {
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_odom_log_time_).count() >= 5) {
             // 使用 atan2 提取 yaw，避免 eulerAngles 奇异性
             double yaw = std::atan2(m_state.last_r(1, 0), m_state.last_r(0, 0));
             double pitch = std::asin(-std::clamp(m_state.last_r(2, 0), -1.0, 1.0));
@@ -670,7 +677,7 @@ public:
                 "[SYNC_DEBUG] LIO odom (local->body): t=(%.3f,%.3f,%.3f) rpy=(%.1f,%.1f,%.1f)deg",
                 m_state.last_t.x(), m_state.last_t.y(), m_state.last_t.z(),
                 roll * 180.0 / M_PI, pitch * 180.0 / M_PI, yaw * 180.0 / M_PI);
-            last_odom_log_time = now;
+            last_odom_log_time_ = now;
         }
         
         if (!m_state.message_received)
@@ -685,12 +692,20 @@ public:
 
     void sendBroadCastTF(builtin_interfaces::msg::Time &time)
     {
+        // Copy offset under lock to avoid data race with processICP() writer
+        M3D offset_r;
+        V3D offset_t;
+        {
+            std::lock_guard<std::mutex> lock(m_state.message_mutex);
+            offset_r = m_state.last_offset_r;
+            offset_t = m_state.last_offset_t;
+        }
         geometry_msgs::msg::TransformStamped transformStamped;
         transformStamped.header.frame_id = m_config.map_frame;
         transformStamped.child_frame_id = m_config.local_frame;
         transformStamped.header.stamp = time;
-        Eigen::Quaterniond q(m_state.last_offset_r);
-        V3D t = m_state.last_offset_t;
+        Eigen::Quaterniond q(offset_r);
+        V3D t = offset_t;
         transformStamped.transform.translation.x = t.x();
         transformStamped.transform.translation.y = t.y();
         transformStamped.transform.translation.z = t.z();
@@ -701,9 +716,8 @@ public:
         m_tf_broadcaster->sendTransform(transformStamped);
         
         // 每5秒输出一次 TF 发布的诊断信息
-        static auto last_tf_log_time = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_tf_log_time).count() >= 5) {
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_tf_log_time_).count() >= 5) {
             // 计算当前完整的 map → body 变换
             M3D current_map_body_r;
             V3D current_map_body_t;
@@ -730,7 +744,7 @@ public:
                 current_map_body_t.x(), current_map_body_t.y(), current_map_body_t.z(),
                 yaw * 180.0 / M_PI,
                 delta_dist, delta_yaw * 180.0 / M_PI);
-            last_tf_log_time = now;
+            last_tf_log_time_ = now;
         }
     }
 
@@ -768,7 +782,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_state.message_mutex);
             m_state.initial_guess.setIdentity();
-            m_state.initial_guess.block<3, 3>(0, 0) = (yaw_angle * roll_angle * pitch_angle).toRotationMatrix().cast<float>();
+            m_state.initial_guess.block<3, 3>(0, 0) = (yaw_angle * pitch_angle * roll_angle).toRotationMatrix().cast<float>();
             m_state.initial_guess.block<3, 1>(0, 3) = V3F(x, y, z);
             m_state.service_received = true;
             m_state.localize_success = false;
@@ -812,10 +826,15 @@ public:
         msg.stamp = this->now();
 
         // 判定状态等级
-        if (!m_state.has_valid_offset) {
-            msg.status = interface::msg::LocalizationStatus::STATUS_UNINITIALIZED;
-        } else if (m_diag.icp_consecutive_fails >= 10) {
+        // 注意：ICP_DIVERGE 会将 has_valid_offset 置为 false，因此必须先判断
+        // icp_consecutive_fails，否则发散后只会发布 UNINITIALIZED 而非 LOST，
+        // 导致 recovery_monitor 的 STATUS_LOST 触发路径永远无法激活。
+        // 额外条件 icp_success_count > 0 区分"曾经定位成功后丢失"（LOST）
+        // 与"从未初始化"（UNINITIALIZED，如启动阶段 map 未加载时的连续 ICP 失败）。
+        if (m_diag.icp_consecutive_fails >= 10 && m_diag.icp_success_count > 0) {
             msg.status = interface::msg::LocalizationStatus::STATUS_LOST;
+        } else if (!m_state.has_valid_offset) {
+            msg.status = interface::msg::LocalizationStatus::STATUS_UNINITIALIZED;
         } else if (m_diag.icp_consecutive_fails >= 3) {
             msg.status = interface::msg::LocalizationStatus::STATUS_DEGRADED;
         } else {
@@ -886,6 +905,10 @@ private:
     
     // 诊断统计
     DiagnosticStats m_diag;
+    
+    // Diagnostic throttle timers (per-instance, not static)
+    std::chrono::steady_clock::time_point last_odom_log_time_{std::chrono::steady_clock::now()};
+    std::chrono::steady_clock::time_point last_tf_log_time_{std::chrono::steady_clock::now()};
 };
 
 // Register as composed node

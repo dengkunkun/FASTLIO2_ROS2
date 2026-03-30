@@ -103,4 +103,8 @@ max_offset_jump_yaw: 15.0         # 单帧offset最大允许yaw变化(deg)
 # 5. 如果定位仍有毛刺（抖动）:
 #    - 减小offset_ema_alpha到0.15-0.2
 #    - 减小max_offset_jump_t到0.5
+#
+# 6. LIO reset_state 服务名:
+#    - 默认 /fastlio2/reset_state (与 recovery_monitor 一致)
+#    - 如果 lio_node 运行在不同的命名空间，需要相应调整
 # =============================================================================
