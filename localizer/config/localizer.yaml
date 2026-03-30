@@ -41,9 +41,9 @@ update_hz: 3.0                     # ICP定位更新频率(Hz)
 # 粗匹配使用较大的体素分辨率，快速收敛到大致位置
 rough_scan_resolution: 0.25        # 输入扫描的体素滤波分辨率(m)
 rough_map_resolution: 0.25         # 地图的体素滤波分辨率(m)
-rough_max_iteration: 10             # 粗匹配最大迭代次数
+rough_max_iteration: 15             # 粗匹配最大迭代次数
                                    # 增大可提高收敛成功率但耗时增加
-rough_score_thresh: 0.2           # 粗匹配fitness score阈值
+rough_score_thresh: 0.25           # 粗匹配fitness score阈值
                                    # 值越大越宽松，建议0.2-0.4
                                    # 如果环境有变化（如家具移动），建议增大到0.3-0.4
 
@@ -54,8 +54,8 @@ rough_score_thresh: 0.2           # 粗匹配fitness score阈值
 refine_scan_resolution: 0.05       # 输入扫描的体素滤波分辨率(m)
                                    # 0.05m提供更精细匹配，减少ICP收敛误差
 refine_map_resolution: 0.05        # 地图的体素滤波分辨率(m)
-refine_max_iteration: 20           # 精匹配最大迭代次数
-                                   # 20次迭代确保充分收敛，减少残余误差
+refine_max_iteration: 25           # 精匹配最大迭代次数
+                                   # 25次迭代确保充分收敛，减少残余误差
 refine_score_thresh: 0.05          # 精匹配fitness score阈值
                                    # 值越大越宽松，建议0.03-0.1
                                    # 与 localizer_node 中 SKIP_FILTER_MAX_REFINE_SCORE 对齐
@@ -66,11 +66,11 @@ refine_score_thresh: 0.05          # 精匹配fitness score阈值
 # 使用EMA(指数移动平均)平滑ICP offset，防止跳变同时保持响应性
 # 工作原理：new_offset = alpha * ICP结果 + (1-alpha) * 历史值
 # 首次ICP和relocalize后不平滑(alpha=1.0)，直接使用ICP结果
-offset_ema_alpha: 0.3              # EMA平滑因子 (0-1)
-                                   # 0.3 = 新ICP结果占30%权重，历史占70%
+offset_ema_alpha: 0.2              # EMA平滑因子 (0-1)
+                                   # 0.2 = 新ICP结果占20%权重，历史占80%
                                    # 值越小越平滑但响应越慢
-                                   # 3Hz × alpha=0.3 → 约1秒完成63%收敛
-                                   # 建议0.2-0.5
+                                   # 3Hz × alpha=0.2 → 约1.5秒完成63%收敛
+                                   # 建议0.15-0.5
 
 # 安全阈值 - 拒绝明显错误的ICP结果（如ICP误收敛到错误位置）
 max_offset_jump_t: 0.8            # 单帧offset最大允许位移变化(m)
@@ -107,4 +107,10 @@ max_offset_jump_yaw: 15.0         # 单帧offset最大允许yaw变化(deg)
 # 6. LIO reset_state 服务名:
 #    - 默认 /fastlio2/reset_state (与 recovery_monitor 一致)
 #    - 如果 lio_node 运行在不同的命名空间，需要相应调整
+#
+# 7. 主动 LIO 漂移修正 (proactive_reset):
+#    - proactive_reset_drift_thresh: offset 漂移多少米后触发 LIO 重置 (默认 0.3m)
+#    - proactive_reset_min_interval: 两次主动重置的最小间隔秒数 (默认 30s)
+#    - proactive_reset_max_refine_score: 只在 ICP 匹配质量好时触发 (默认 0.03)
+#    - 设 proactive_reset_drift_thresh 为很大的值 (如 999) 可禁用此功能
 # =============================================================================

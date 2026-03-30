@@ -45,6 +45,12 @@ struct NodeConfig
     
     // LIO reset_state 服务名 (须与 lio_node 的实际服务路径一致)
     std::string lio_reset_service = "/fastlio2/reset_state";
+    
+    // 主动 LIO 漂移修正: 当 offset 漂移超过阈值时，主动重置 LIO 到 ICP 位姿
+    // 避免 LIO 漂移超出 ICP 收敛域导致连续失败
+    double proactive_reset_drift_thresh = 0.3;  // 触发主动重置的累积 offset 漂移阈值 (m)
+    double proactive_reset_min_interval = 30.0; // 两次主动重置之间的最小间隔 (s)
+    double proactive_reset_max_refine_score = 0.03; // 只在 ICP 质量好时重置 (refine_score 上限)
 };
 
 // ============================================================================
@@ -82,6 +88,11 @@ struct DiagnosticStats
     std::chrono::steady_clock::time_point last_diag_print_time = std::chrono::steady_clock::now();
     double max_icp_gap_seconds = 0.0;     // 最长无成功 ICP 的间隔
     
+    // 漂移率追踪 (每个诊断周期的 offset 变化)
+    V3D diag_period_start_offset_t = V3D::Zero();  // 诊断周期开始时的 offset
+    bool diag_period_has_start = false;
+    double diag_period_max_drift_rate = 0.0;        // 历史最高漂移率 (m/min)
+    
     // 输入数据质量
     size_t min_cloud_size = SIZE_MAX;
     size_t max_cloud_size = 0;
@@ -117,6 +128,12 @@ struct NodeState
     // 暖机状态 — relocalize 后暂时禁用安全阈值，让 ICP 快速收敛
     uint64_t warmup_remaining = 0;              // 剩余暖机 ICP 次数
     static constexpr uint64_t WARMUP_COUNT = 10; // relocalize 后的暖机 ICP 次数
+    
+    // 主动 LIO 漂移修正状态
+    V3D proactive_reset_anchor_t = V3D::Zero(); // 上次主动重置后的 anchor offset 位置
+    bool proactive_reset_has_anchor = false;    // 是否已设置 anchor
+    std::chrono::steady_clock::time_point last_proactive_reset_time = std::chrono::steady_clock::now();
+    uint64_t proactive_reset_count = 0;         // 主动重置次数统计
     
     // For async processing
     bool new_data_available = false;
@@ -217,11 +234,25 @@ public:
         if (config["lio_reset_service"]) {
             m_config.lio_reset_service = config["lio_reset_service"].as<std::string>();
         }
+        if (config["proactive_reset_drift_thresh"]) {
+            m_config.proactive_reset_drift_thresh = config["proactive_reset_drift_thresh"].as<double>();
+        }
+        if (config["proactive_reset_min_interval"]) {
+            m_config.proactive_reset_min_interval = config["proactive_reset_min_interval"].as<double>();
+        }
+        if (config["proactive_reset_max_refine_score"]) {
+            m_config.proactive_reset_max_refine_score = config["proactive_reset_max_refine_score"].as<double>();
+        }
         RCLCPP_INFO(this->get_logger(), 
             "[CONFIG] ICP offset filter: max_jump_t=%.3fm, max_jump_yaw=%.1fdeg, ema_alpha=%.2f",
             m_config.max_offset_jump_t, m_config.max_offset_jump_yaw, m_config.offset_ema_alpha);
         RCLCPP_INFO(this->get_logger(), 
             "[CONFIG] LIO reset service: %s", m_config.lio_reset_service.c_str());
+        RCLCPP_INFO(this->get_logger(), 
+            "[CONFIG] Proactive LIO reset: drift_thresh=%.2fm, min_interval=%.0fs, max_score=%.3f",
+            m_config.proactive_reset_drift_thresh,
+            m_config.proactive_reset_min_interval,
+            m_config.proactive_reset_max_refine_score);
     }
     
     // Lightweight timer callback - only handles TF broadcasting
@@ -527,6 +558,41 @@ public:
                 m_state.offset_ref_local_r = current_local_r;
                 m_state.offset_ref_local_t = current_local_t;
                 m_state.has_valid_offset = true;
+                
+                // === 主动 LIO 漂移修正 ===
+                // 监测 offset 累积漂移: 当 ICP 不断修正同一方向的偏差时，
+                // 说明 LIO 在持续漂移。在漂移超出 ICP 收敛域之前主动重置 LIO。
+                if (!m_state.proactive_reset_has_anchor) {
+                    m_state.proactive_reset_anchor_t = final_offset_t;
+                    m_state.proactive_reset_has_anchor = true;
+                } else if (!in_warmup) {
+                    double drift_from_anchor = (final_offset_t - m_state.proactive_reset_anchor_t).head<2>().norm();
+                    auto now = std::chrono::steady_clock::now();
+                    double since_last_reset = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - m_state.last_proactive_reset_time).count() / 1000.0;
+                    
+                    if (drift_from_anchor > m_config.proactive_reset_drift_thresh &&
+                        since_last_reset > m_config.proactive_reset_min_interval &&
+                        refine_score < m_config.proactive_reset_max_refine_score) {
+                        
+                        m_state.proactive_reset_count++;
+                        RCLCPP_WARN(this->get_logger(),
+                            "[PROACTIVE_RESET] Offset drift=%.3fm exceeds threshold %.2fm "
+                            "(refine_score=%.4f, since_last=%.0fs, count=%lu). "
+                            "Resetting LIO to ICP-corrected pose.",
+                            drift_from_anchor, m_config.proactive_reset_drift_thresh,
+                            refine_score, since_last_reset, m_state.proactive_reset_count);
+                        
+                        requestLioReset(map_body_t.x(), map_body_t.y(), map_body_t.z(),
+                                        map_body_yaw, map_body_pitch, map_body_roll);
+                        
+                        // 清除 anchor — 暖机结束后第一次 ICP 会重新建立基准
+                        // 不能用当前 offset 做 anchor，因为 LIO 重置后 offset 会骤降到 ~0
+                        m_state.proactive_reset_has_anchor = false;
+                        m_state.last_proactive_reset_time = now;
+                        m_state.warmup_remaining = NodeState::WARMUP_COUNT / 2; // 半暖机(比relocalize短)
+                    }
+                }
             }
             
             if (!m_state.localize_success && m_state.service_received)
@@ -542,6 +608,10 @@ public:
                 // 通知 FAST-LIO 重置 IESKF 状态到 ICP 确认的位姿
                 requestLioReset(map_body_t.x(), map_body_t.y(), map_body_t.z(),
                                 map_body_yaw, map_body_pitch, map_body_roll);
+                // 重置 anchor 到当前 offset (刚重定位，offset 是准确的)
+                m_state.proactive_reset_anchor_t = final_offset_t;
+                m_state.proactive_reset_has_anchor = true;
+                m_state.last_proactive_reset_time = std::chrono::steady_clock::now();
             }
         }
         else
@@ -590,6 +660,21 @@ public:
                 m_diag.icp_score_sum / m_diag.icp_success_count : 0.0;
             double drift_from_origin = (m_diag.prev_odom_t - m_diag.first_odom_t).head<2>().norm();
             
+            // 计算本诊断周期的 offset 漂移率
+            double period_drift_rate = 0.0; // m/min
+            if (m_diag.diag_period_has_start && m_state.has_valid_offset) {
+                double period_drift = (m_state.last_offset_t - m_diag.diag_period_start_offset_t).head<2>().norm();
+                period_drift_rate = period_drift / (since_last_diag / 60.0); // m/min
+                if (period_drift_rate > m_diag.diag_period_max_drift_rate) {
+                    m_diag.diag_period_max_drift_rate = period_drift_rate;
+                }
+            }
+            // 记录下一周期的起始 offset
+            if (m_state.has_valid_offset) {
+                m_diag.diag_period_start_offset_t = m_state.last_offset_t;
+                m_diag.diag_period_has_start = true;
+            }
+            
             RCLCPP_WARN(this->get_logger(),
                 "╔══════════════════════════════════════════════════════════════╗");
             RCLCPP_WARN(this->get_logger(),
@@ -611,6 +696,9 @@ public:
                 "║ Offset yaw: max_single=%.3fdeg                              ║",
                 m_diag.max_delta_offset_yaw);
             RCLCPP_WARN(this->get_logger(),
+                "║ Drift rate: current=%.3fm/min peak=%.3fm/min                ║",
+                period_drift_rate, m_diag.diag_period_max_drift_rate);
+            RCLCPP_WARN(this->get_logger(),
                 "║ Fails: max_consecutive=%lu max_gap=%.1fs reject=%lu         ║",
                 m_diag.icp_max_consecutive_fails, m_diag.max_icp_gap_seconds,
                 m_state.icp_reject_count);
@@ -618,6 +706,11 @@ public:
                 "║ Cloud: min=%zu max=%zu  LIO_dist_from_origin=%.2fm          ║",
                 m_diag.min_cloud_size < SIZE_MAX ? m_diag.min_cloud_size : (size_t)0,
                 m_diag.max_cloud_size, drift_from_origin);
+            double anchor_drift = m_state.proactive_reset_has_anchor ?
+                (m_state.last_offset_t - m_state.proactive_reset_anchor_t).head<2>().norm() : 0.0;
+            RCLCPP_WARN(this->get_logger(),
+                "║ Proactive LIO reset: count=%lu anchor_drift=%.3fm           ║",
+                m_state.proactive_reset_count, anchor_drift);
             RCLCPP_WARN(this->get_logger(),
                 "╚══════════════════════════════════════════════════════════════╝");
         }
