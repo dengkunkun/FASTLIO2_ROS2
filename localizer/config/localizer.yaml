@@ -43,9 +43,10 @@ rough_scan_resolution: 0.25        # 输入扫描的体素滤波分辨率(m)
 rough_map_resolution: 0.25         # 地图的体素滤波分辨率(m)
 rough_max_iteration: 15             # 粗匹配最大迭代次数
                                    # 增大可提高收敛成功率但耗时增加
-rough_score_thresh: 0.25           # 粗匹配fitness score阈值
+rough_score_thresh: 0.35           # 粗匹配fitness score阈值
                                    # 值越大越宽松，建议0.2-0.4
-                                   # 如果环境有变化（如家具移动），建议增大到0.3-0.4
+                                   # 适度放宽以提高 recovery 重定位成功率
+                                   # 如果环境有变化（如家具移动），可增大到0.4
 
 # -----------------------------------------------------------------------------
 # 精匹配ICP配置 (Refine ICP Configuration) - 第二阶段
@@ -73,11 +74,19 @@ offset_ema_alpha: 0.2              # EMA平滑因子 (0-1)
                                    # 建议0.15-0.5
 
 # 安全阈值 - 拒绝明显错误的ICP结果（如ICP误收敛到错误位置）
-max_offset_jump_t: 0.8            # 单帧offset最大允许位移变化(m)
-                                   # 超过此值完全拒绝（不进入EMA）
-                                   # 3Hz下正常漂移<0.02m/帧，0.8m为极端异常
-max_offset_jump_yaw: 15.0         # 单帧offset最大允许yaw变化(deg)
+max_offset_jump_t: 0.4            # 单帧offset最大允许位移变化(m)
+                                   # 降低阈值以更早检测 LIO 漂移
+                                   # 3Hz下正常漂移<0.02m/帧，0.4m为极端异常
+max_offset_jump_yaw: 10.0         # 单帧offset最大允许yaw变化(deg)
                                    # 超过此值完全拒绝
+
+# -----------------------------------------------------------------------------
+# 主动 LIO 漂移修正 (Proactive LIO Reset)
+# -----------------------------------------------------------------------------
+# 当 ICP 检测到 offset 持续漂移时，主动重置 LIO 以防止进一步发散
+proactive_reset_drift_thresh: 0.2  # 触发阈值(m)，降低以更早干预漂移
+proactive_reset_min_interval: 15.0 # 两次重置最小间隔(s)，缩短以加快响应
+proactive_reset_max_refine_score: 0.03  # 只在 ICP 质量好时触发
 
 # =============================================================================
 # 调参建议

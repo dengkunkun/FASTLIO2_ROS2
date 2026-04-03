@@ -487,8 +487,9 @@ void MapUpdaterNode::logDiagnostics()
                 "pts_added=%lu pts_removed=%lu",
                 core_->validNum(), core_->treeSize(), core_->voxelMapSize(),
                 core_->minLogOdds(),
-                scans_received_, scans_processed_, scans_dropped_no_odom_,
-                points_added_total_, points_removed_total_);
+                scans_received_.load(), scans_processed_.load(),
+                scans_dropped_no_odom_.load(),
+                points_added_total_.load(), points_removed_total_.load());
 
     auto hist = core_->getLogOddsHistogram();
     RCLCPP_INFO(get_logger(),

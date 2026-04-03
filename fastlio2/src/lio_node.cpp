@@ -186,7 +186,8 @@ public:
         m_state_data.lidar_buffer.emplace_back(timestamp, cloud);
         m_state_data.last_lidar_time = timestamp;
         
-        // Notify processing thread that new data is available
+        // Signal and notify processing thread that new data is available
+        m_lidar_data_ready = true;
         m_cv.notify_one();
     }
 
@@ -306,11 +307,7 @@ public:
             {
                 std::unique_lock<std::mutex> lock(m_cv_mutex);
                 m_cv.wait_for(lock, 20ms, [this]() {
-                    if (!m_running) {
-                        return true;
-                    }
-                    std::lock_guard<std::mutex> lidar_lock(m_state_data.lidar_mutex);
-                    return !m_state_data.lidar_buffer.empty();
+                    return !m_running || m_lidar_data_ready.load();
                 });
             }
             
@@ -318,6 +315,8 @@ public:
             
             // Process available data
             processOnce();
+            // Reset after processing so notifications during syncPackage aren't lost
+            m_lidar_data_ready = false;
         }
     }
 
@@ -373,10 +372,9 @@ public:
         // FAST-LIO2 状态诊断日志 (每10秒输出一次)
         // ============================================================
         m_lio_frame_count++;
-        static auto last_lio_diag_time = std::chrono::steady_clock::now();
         auto now_diag = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now_diag - last_lio_diag_time).count() >= 10) {
-            last_lio_diag_time = now_diag;
+        if (std::chrono::duration_cast<std::chrono::seconds>(now_diag - last_lio_diag_time_).count() >= 10) {
+            last_lio_diag_time_ = now_diag;
             
             const auto& state = m_kf->x();
             const auto& P = m_kf->P();
@@ -521,11 +519,13 @@ private:
     // Thread management for async processing
     std::thread m_process_thread;
     std::atomic<bool> m_running;
+    std::atomic<bool> m_lidar_data_ready{false};
     std::mutex m_cv_mutex;
     std::condition_variable m_cv;
     
     // 诊断计数器
     uint64_t m_lio_frame_count = 0;
+    std::chrono::steady_clock::time_point last_lio_diag_time_{std::chrono::steady_clock::now()};
     int m_localization_mode_frame_count = 0;  // 定位模式延迟冻结帧计数
 };
 

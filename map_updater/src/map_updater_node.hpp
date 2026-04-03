@@ -132,10 +132,10 @@ private:
     Clock::time_point last_publish_time_;
     Clock::time_point last_diag_time_;
 
-    // Diagnostics
-    uint64_t scans_received_ = 0;
-    uint64_t scans_processed_ = 0;
-    uint64_t scans_dropped_no_odom_ = 0;
-    uint64_t points_added_total_ = 0;
-    uint64_t points_removed_total_ = 0;
+    // Diagnostics (atomic: written in callback thread, read in process thread)
+    std::atomic<uint64_t> scans_received_{0};
+    std::atomic<uint64_t> scans_processed_{0};
+    std::atomic<uint64_t> scans_dropped_no_odom_{0};
+    std::atomic<uint64_t> points_added_total_{0};
+    std::atomic<uint64_t> points_removed_total_{0};
 };

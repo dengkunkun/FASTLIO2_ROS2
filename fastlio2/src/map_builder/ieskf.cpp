@@ -1,4 +1,6 @@
 #include "ieskf.h"
+#include <chrono>
+#include <cstdio>
 
 double State::gravity = 9.81;
 
@@ -22,9 +24,28 @@ void State::operator+=(const V21D &delta)
     // 饱和限制: 防止 LiDAR 特征退化期间偏差估计发散到物理不合理值
     // MEMS 陀螺仪典型 bias ±0.01 rad/s，±0.1 rad/s 为 10x 余量
     // MEMS 加速度计典型 bias ±0.1 m/s²，±2.0 m/s² 为 20x 余量
+    V3D bg_pre = bg;
     bg = bg.cwiseMax(V3D(-0.1, -0.1, -0.1)).cwiseMin(V3D(0.1, 0.1, 0.1));
     ba += delta.segment<3>(18);
+    V3D ba_pre = ba;
     ba = ba.cwiseMax(V3D(-2.0, -2.0, -2.0)).cwiseMin(V3D(2.0, 2.0, 2.0));
+
+    // Rate-limited warning when bias hits saturation limits
+    bool bg_sat = bg_pre.cwiseAbs().maxCoeff() > 0.1;
+    bool ba_sat = ba_pre.cwiseAbs().maxCoeff() > 2.0;
+    if (bg_sat || ba_sat) {
+        static auto last_warn_time = std::chrono::steady_clock::time_point{};
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_warn_time >= std::chrono::seconds(1)) {
+            last_warn_time = now;
+            if (bg_sat)
+                fprintf(stderr, "[IESKF] ERROR: Gyro bias saturated (bg: [%.4f, %.4f, %.4f] clamped to +/-0.1 rad/s) — check IMU health\n",
+                        bg_pre(0), bg_pre(1), bg_pre(2));
+            if (ba_sat)
+                fprintf(stderr, "[IESKF] ERROR: Accel bias saturated (ba: [%.4f, %.4f, %.4f] clamped to +/-2.0 m/s^2) — check IMU health\n",
+                        ba_pre(0), ba_pre(1), ba_pre(2));
+        }
+    }
 }
 
 V21D State::operator-(const State &other) const
